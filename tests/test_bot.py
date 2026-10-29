@@ -126,5 +126,38 @@ class TestImageFilesExist(unittest.TestCase):
             self.assertTrue(os.path.isfile(path), f"Missing image: {filename}")
 
 
+class TestReturningUserWarning(unittest.TestCase):
+    """✅⚠️ must trigger the special case; ✅ alone must not."""
+
+    def _run(self, warn_visible):
+        from collections import namedtuple
+        from PIL import Image
+
+        line = Image.open(bot.img_path("discord_server_returning_warn.png")).convert("RGB")
+        if not warn_visible:
+            bg = line.getpixel((95, 8))
+            for x in range(80, line.width):
+                for y in range(line.height):
+                    line.putpixel((x, y), bg)
+        screen = Image.new("RGB", (400, 200), line.getpixel((95, 8)))
+        screen.paste(line, (100, 50))
+
+        Box = namedtuple("Box", "left top width height")
+        bot.pyautogui.locateOnScreen = lambda *a, **k: Box(100, 50, 80, 17)
+        bot.pyautogui.screenshot = lambda region: screen.crop(
+            (region[0], region[1], region[0] + region[2], region[1] + region[3]))
+        return bot.has_returning_user_warning((0, 0, 400, 200))
+
+    def test_check_and_warning_is_special_case(self):
+        self.assertTrue(self._run(warn_visible=True))
+
+    def test_check_only_is_normal_ticket(self):
+        self.assertFalse(self._run(warn_visible=False))
+
+    def test_server_line_not_found(self):
+        bot.pyautogui.locateOnScreen = lambda *a, **k: None
+        self.assertFalse(bot.has_returning_user_warning((0, 0, 400, 200)))
+
+
 if __name__ == "__main__":
     unittest.main()
