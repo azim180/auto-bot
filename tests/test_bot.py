@@ -15,6 +15,7 @@ def _stub_module(name, **attrs):
     mod = types.ModuleType(name)
     mod.__dict__.update(attrs)
     sys.modules[name] = mod
+    return mod
 
 # pyautogui stub
 _pag = _stub_module("pyautogui", FAILSAFE=True, PAUSE=0.25)
