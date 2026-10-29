@@ -29,6 +29,9 @@ _pag.write  = lambda *a, **k: None
 _pag.scroll = lambda *a, **k: None
 _pag.dragTo = lambda *a, **k: None
 _pag.center = lambda b: b
+_pag.easeOutQuad = lambda n: n
+_pag.position = lambda: (0, 0)
+_pag.size = lambda: (1440, 900)
 
 # cv2 stub (opencv-python)
 _stub_module("cv2")
@@ -157,6 +160,97 @@ class TestReturningUserWarning(unittest.TestCase):
     def test_server_line_not_found(self):
         bot.pyautogui.locateOnScreen = lambda *a, **k: None
         self.assertFalse(bot.has_returning_user_warning((0, 0, 400, 200)))
+
+
+class TestValueChecks(unittest.TestCase):
+    def test_phone_numbers(self):
+        for text in ("0612345678", "+33 6 12 34 56 78", "06 12 34 56 78"):
+            self.assertTrue(bot.looks_like_phone(text), text)
+        for text in ("", "Number", "Number -> 0612345678", "12"):
+            self.assertFalse(bot.looks_like_phone(text), text)
+
+    def test_codes(self):
+        for text in ("1234", "123456"):
+            self.assertTrue(bot.looks_like_code(text), text)
+        for text in ("", "12", "5 seconds ago", "Code"):
+            self.assertFalse(bot.looks_like_code(text), text)
+
+
+Point = __import__("collections").namedtuple("Point", "x y")
+
+
+class TestCopyValueDoubleClick(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        self.clicks = []
+        self.clipboard = []
+        self._patchers = [
+            mock.patch.object(bot, "human_pause", lambda *a, **k: None),
+            mock.patch.object(bot, "wait_for_element", lambda *a, **k: Point(100, 200)),
+            mock.patch.object(bot, "set_clipboard_text", lambda text: None),
+            mock.patch.object(bot, "get_clipboard_text", lambda: self.clipboard.pop(0) if self.clipboard else ""),
+            mock.patch.object(bot.pyautogui, "click", lambda *a, **k: self.clicks.append(k.get("clicks", 1))),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+
+    def test_double_clicks_the_number(self):
+        self.clipboard = ["06 12 34 56 78"]
+        result = bot.copy_value_next_to_label("discord_number_label.png", is_valid=bot.looks_like_phone)
+        self.assertEqual(result, "06 12 34 56 78")
+        self.assertEqual(self.clicks, [2])
+
+    def test_retries_when_copied_text_is_not_a_number(self):
+        self.clipboard = ["Number", "0612345678"]
+        result = bot.copy_value_next_to_label("discord_number_label.png", is_valid=bot.looks_like_phone)
+        self.assertEqual(result, "0612345678")
+        self.assertEqual(self.clicks, [2, 2])
+
+
+class TestWaitForDiscordUpdate(unittest.TestCase):
+    def _frames(self, frames, then):
+        frames = list(frames)
+        return lambda region: frames.pop(0) if frames else then()
+
+    def test_settles_once_screen_stops_changing(self):
+        from unittest import mock
+        with mock.patch.object(bot, "_grab", self._frames(["a", "b", "c"], lambda: "c")):
+            self.assertTrue(bot.wait_for_screen_settle((0, 0, 1, 1), settle=0.05, timeout=1, interval=0.01))
+
+    def test_does_not_settle_while_screen_keeps_changing(self):
+        from unittest import mock
+        counter = iter(range(10 ** 6))
+        with mock.patch.object(bot, "_grab", lambda region: next(counter)):
+            self.assertFalse(bot.wait_for_screen_settle((0, 0, 1, 1), settle=0.05, timeout=0.2, interval=0.01))
+
+    def test_detects_change_after_click(self):
+        from unittest import mock
+        with mock.patch.object(bot, "_grab", self._frames(["a", "a"], lambda: "b")):
+            self.assertTrue(bot.wait_for_screen_change((0, 0, 1, 1), "a", timeout=1, interval=0.01))
+        with mock.patch.object(bot, "_grab", lambda region: "a"):
+            self.assertFalse(bot.wait_for_screen_change((0, 0, 1, 1), "a", timeout=0.05, interval=0.01))
+
+
+class TestActionMenuUsesNewestTicket(unittest.TestCase):
+    def test_action_dropdown_is_searched_bottom_first(self):
+        from unittest import mock
+        calls = {}
+
+        def fake_wait(image_name, **kwargs):
+            calls[image_name] = kwargs
+            return Point(100, 200)
+
+        with mock.patch.object(bot, "wait_for_element", fake_wait), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "human_pause", lambda *a, **k: None), \
+             mock.patch.object(bot, "human_click", lambda *a, **k: None), \
+             mock.patch.object(bot, "click_and_wait_for_update", lambda *a, **k: None):
+            self.assertTrue(bot.select_discord_action_menu_item("discord_menu_mark_verified.png"))
+        self.assertTrue(calls["discord_action_dropdown.png"]["pick_bottom"])
 
 
 if __name__ == "__main__":
