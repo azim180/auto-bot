@@ -258,12 +258,20 @@ def select_discord_action_menu_item(menu_item_img):
     switch_to_discord()
     time.sleep(0.5)
     print(f"[DISCORD] Opening Action dropdown for {menu_item_img}...")
-    if click_element("discord_action_dropdown.png", confidence=0.80, pick_bottom=True):
+    # Wait up to 5s for the Action button to appear (embed may still be updating after claim)
+    action_loc = wait_for_element("discord_action_dropdown.png", timeout=5, confidence=0.80)
+    if not action_loc:
+        print("[WARN] Could not find Action dropdown button")
+        return False
+    pyautogui.click(action_loc.x, action_loc.y)
+    time.sleep(1.5)  # give the dropdown menu time to fully open
+    loc = wait_for_element(menu_item_img, timeout=6, confidence=0.78, pick_bottom=True)
+    if loc:
+        pyautogui.click(loc.x, loc.y)
         time.sleep(1.0)
-        if wait_for_element(menu_item_img, timeout=4, confidence=0.80, pick_bottom=True):
-            click_element(menu_item_img, confidence=0.80, pick_bottom=True)
-            time.sleep(1.0)
-            return True
+        return True
+    print(f"[WARN] Could not find {menu_item_img} in dropdown menu")
+    pyautogui.press("escape")  # close the open dropdown
     return False
 
 
@@ -328,6 +336,7 @@ def process_ticket():
     # SPECIAL CASE: Server -> ✅ ⚠️ (Claim -> Action -> Mark as Verified immediately)
     if is_returning_user:
         print("[SPECIAL CASE] Returning user (✅ ⚠️) detected! Marking as Verified via Action menu...")
+        time.sleep(1.0)  # extra wait for embed to update after claim
         select_discord_action_menu_item("discord_menu_mark_verified.png")
         return False
 
