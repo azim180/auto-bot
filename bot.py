@@ -265,12 +265,27 @@ def select_discord_action_menu_item(menu_item_img):
         return False
     pyautogui.click(action_loc.x, action_loc.y)
     time.sleep(1.5)  # give the dropdown menu time to fully open
-    loc = wait_for_element(menu_item_img, timeout=6, confidence=0.78, pick_bottom=True)
-    if loc:
-        pyautogui.click(loc.x, loc.y)
-        time.sleep(1.0)
-        return True
-    print(f"[WARN] Could not find {menu_item_img} in dropdown menu")
+
+    # Open menu rows render on a different shade than the cropped template, so match in
+    # grayscale and step the confidence down until the option is found.
+    path = img_path(menu_item_img)
+    for conf in (0.80, 0.75, 0.70, 0.65):
+        try:
+            loc = pyautogui.locateCenterOnScreen(path, confidence=conf, grayscale=True)
+        except Exception:
+            loc = None
+        if loc:
+            print(f"[DISCORD] Found {menu_item_img} (confidence {conf:.2f}), clicking...")
+            pyautogui.click(loc.x, loc.y)
+            time.sleep(1.0)
+            return True
+
+    debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_dropdown.png")
+    try:
+        pyautogui.screenshot(debug_path)
+        print(f"[WARN] Could not find {menu_item_img} in dropdown menu. Screenshot saved: {debug_path}")
+    except Exception:
+        print(f"[WARN] Could not find {menu_item_img} in dropdown menu")
     pyautogui.press("escape")  # close the open dropdown
     return False
 
