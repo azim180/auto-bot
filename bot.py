@@ -463,9 +463,8 @@ def process_ticket():
             switch_to_discord()
             time.sleep(0.8)
 
-            # Click Mark as Verified button
-            if not click_element("discord_mark_verified_btn.png", confidence=0.82, pick_bottom=True):
-                select_discord_action_menu_item("discord_menu_mark_verified.png")
+            # Click Mark as Verified button directly (Action menu only used for ✅⚠️ case)
+            click_element("discord_mark_verified_btn.png", confidence=0.82, pick_bottom=True)
             time.sleep(1.2)
 
             # Type "im the bot and done" in the channel chat bar and stop claiming!
