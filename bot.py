@@ -265,12 +265,19 @@ def select_discord_action_menu_item(menu_item_img):
         return False
     pyautogui.click(action_loc.x, action_loc.y)
     time.sleep(1.5)  # give the dropdown menu time to fully open
+
     loc = wait_for_element(menu_item_img, timeout=6, confidence=0.78, pick_bottom=True)
     if loc:
         pyautogui.click(loc.x, loc.y)
         time.sleep(1.0)
         return True
-    print(f"[WARN] Could not find {menu_item_img} in dropdown menu")
+
+    debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_dropdown.png")
+    try:
+        pyautogui.screenshot(debug_path)
+        print(f"[WARN] Could not find {menu_item_img} in dropdown menu. Screenshot saved: {debug_path}")
+    except Exception:
+        print(f"[WARN] Could not find {menu_item_img} in dropdown menu")
     pyautogui.press("escape")  # close the open dropdown
     return False
 
@@ -310,6 +317,25 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT):
     return None
 
 
+def has_returning_user_warning(embed_region):
+    """True only when the Server line shows ✅ followed by ⚠️; ✅ alone is a normal ticket."""
+    try:
+        box = pyautogui.locateOnScreen(img_path("discord_server_line.png"), confidence=0.83, region=embed_region)
+    except Exception:
+        box = None
+    if not box:
+        return False
+    # ⚠️ is too small a part of the line for template matching to tell apart, so count
+    # its yellow pixels in the strip just right of the ✅ instead.
+    strip = (int(box.left + box.width), max(0, int(box.top) - 2), 20, int(box.height) + 4)
+    try:
+        raw = pyautogui.screenshot(region=strip).convert("RGB").tobytes()
+    except Exception:
+        return False
+    yellow = sum(1 for r, g, b in zip(raw[0::3], raw[1::3], raw[2::3]) if r > 180 and g > 140 and b < 90)
+    return yellow >= 8
+
+
 # ==============================================================================
 # MAIN TICKET WORKFLOW
 # ==============================================================================
@@ -325,7 +351,7 @@ def process_ticket():
 
     # Look in a region just above the Claim button for the ✅ ⚠️ indicator
     embed_region = (max(0, int(claim_loc.x - 120)), max(0, int(claim_loc.y - 160)), 350, 160)
-    is_returning_user = locate_element("discord_server_returning_warn.png", confidence=0.83, region=embed_region) is not None
+    is_returning_user = has_returning_user_warning(embed_region)
 
     # Click Claim on this ticket
     print("[TICKET] Clicking Claim button...")
