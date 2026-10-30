@@ -97,7 +97,11 @@ def set_clipboard_text(text):
 
 def extract_phone(text):
     """Returns the phone number found in copied text (spaces kept), or "" if there is none."""
-    for match in re.findall(r"\+?\d[\d \-]*\d", text):
+    # Discord separates the digit groups with non-breaking spaces; turn every kind of
+    # space into a plain one and drop zero-width characters before matching
+    text = re.sub(r"[​-‍⁠﻿]", "", text)
+    text = re.sub(r"[^\S\n]+", " ", text)
+    for match in re.findall(r"\+?\d[\d \-.]*\d", text):
         if 8 <= len(re.sub(r"\D", "", match)) <= 15:
             return match.strip()
     return ""
@@ -459,11 +463,10 @@ def find_value_box(label):
     return None
 
 
-def copy_ticket_value(label_img, region, extract, default_offsets, drag_fallback=True):
+def copy_ticket_value(label_img, region, extract, default_offsets):
     """
     Finds `Number →` / `Code →` inside `region` (the ticket being handled), double-clicks
-    the value in its box and copies it. A spaced phone number only half-selects on a
-    double-click, so `drag_fallback` then drags across the whole box.
+    the value in its box and copies it.
     Returns the cleaned value, or "" if nothing valid could be copied.
     """
     copied = ""
@@ -482,17 +485,7 @@ def copy_ticket_value(label_img, region, extract, default_offsets, drag_fallback
         if value:
             return value
 
-        if drag_fallback:
-            set_clipboard_text("")
-            human_move(left - 1, y, jitter=0)
-            pyautogui.dragTo(right + 4, y, duration=random.uniform(0.2, 0.35), button="left")
-            human_pause(0.05, 0.1)
-            copied = copy_selection()
-            value = extract(copied)
-            if value:
-                return value
-
-        print(f"[WARN] Copied '{copied}', which is not a valid value (try {attempt}/2)")
+        print(f"[WARN] Copied {copied!r}, which is not a valid value (try {attempt}/2)")
         human_pause(0.2, 0.4)
     return ""
 
@@ -547,7 +540,7 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT):
             wait_for_screen_settle(screen_area_around(mark_loc.x, mark_loc.y), settle=0.3, timeout=2, interval=0.08)
             # Only read the Code from the ticket this button belongs to
             code_region = screen_area_around(mark_loc.x, mark_loc.y, left=200, up=160, right=250, down=0)
-            code = copy_ticket_value("discord_code_label.png", code_region, extract_code, CODE_BOX_OFFSETS, drag_fallback=False)
+            code = copy_ticket_value("discord_code_label.png", code_region, extract_code, CODE_BOX_OFFSETS)
             if code:
                 print(f"[CODE COPIED] Extracted verification code: {code}")
                 return code
