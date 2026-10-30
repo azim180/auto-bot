@@ -117,6 +117,16 @@ class TestImgPath(unittest.TestCase):
         self.assertIn("images", result)
 
 
+class TestEveryReferencedImageExists(unittest.TestCase):
+    def test_all_images_used_by_bot_are_in_images_folder(self):
+        import re
+        source = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.py")).read()
+        names = set(re.findall(r'"([a-z0-9_]+\.png)"', source)) - {"debug_dropdown.png"}
+        self.assertTrue(names)
+        missing = sorted(n for n in names if not os.path.isfile(bot.img_path(n)))
+        self.assertEqual(missing, [])
+
+
 class TestImageFilesExist(unittest.TestCase):
     """Every image referenced in COORDS_1440x900 must exist in images/."""
     COORD_TO_FILE = {
