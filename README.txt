@@ -27,11 +27,18 @@ HOW TO RUN:
 
 SCREEN RESOLUTION:
 The bot finds buttons by comparing small cropped images, pixel for pixel, so
-Windows display scaling must be 100% and Discord must use its dark theme.
-Each resolution has its own folder in images/. An image missing from the
-1920x1080 folder is borrowed from 1440x900 (buttons are the same size at 100%
-scaling), so only re-crop the ones the bot cannot find. Fixed backup click
-spots exist for 1440x900 only; on 1920x1080 the bot only clicks what it sees.
+Windows display scaling must be 100% (it warns at startup if not) and Discord
+must use its dark theme. Any screen resolution works: each has its own folder
+in images/, and an image missing there is borrowed from 1440x900 (buttons are
+the same size at 100% scaling), so only re-crop the ones the bot cannot find.
+Fixed backup click spots exist for 1440x900 only; elsewhere the bot only
+clicks what it sees.
+
+DURING A TICKET:
+The bot remembers its ticket by the phone-number box, so new tickets arriving
+(and pushing it up the chat) don't confuse it - it scrolls up to it if needed
+and back down afterwards. If the ticket's Code shows "Left" (the user left),
+it stops that ticket, resets iTunes and waits for the next one.
 
 SAFETY STOP:
 Slam your mouse cursor into ANY of the 4 corners of your monitor at any
