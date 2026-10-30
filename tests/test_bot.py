@@ -292,13 +292,26 @@ class TestOtherDiscordTheme(unittest.TestCase):
 class TestCopyTicketValue(unittest.TestCase):
     def setUp(self):
         from unittest import mock
-        self.clicks, self.moves, self.drags, self.clipboard = [], [], [], []
+        # self.clipboard: what each Ctrl+C copies in turn; self.board: what is on the clipboard now
+        self.clicks, self.moves, self.drags, self.clipboard, self.board = [], [], [], [], ""
+        self.can_empty = True
+
+        def set_board(text):
+            if text or self.can_empty:
+                self.board = text
+
+        def hotkey(*keys):
+            if keys == ("ctrl", "c") and self.clipboard:
+                self.board = self.clipboard.pop(0)
+
         self._patchers = [
             mock.patch.object(bot, "human_pause", lambda *a, **k: None),
             mock.patch.object(bot, "wait_for_element", lambda *a, **k: Point(111, 120)),
             mock.patch.object(bot, "find_value_box", lambda label: (150, 222)),
-            mock.patch.object(bot, "set_clipboard_text", lambda text: None),
-            mock.patch.object(bot, "get_clipboard_text", lambda: self.clipboard.pop(0) if self.clipboard else ""),
+            mock.patch.object(bot, "set_clipboard_text", set_board),
+            mock.patch.object(bot, "get_clipboard_text", lambda: self.board),
+            mock.patch.object(bot, "human_hotkey", hotkey),
+            mock.patch.object(bot.time, "sleep", lambda s: None),
             mock.patch.object(bot.pyautogui, "click", lambda *a, **k: self.clicks.append(k.get("clicks", 1))),
             mock.patch.object(bot.pyautogui, "moveTo", lambda x, y, **k: self.moves.append((x, y))),
             mock.patch.object(bot.pyautogui, "dragTo", lambda x, y, **k: self.drags.append((x, y))),
@@ -348,6 +361,71 @@ class TestCopyTicketValue(unittest.TestCase):
         number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
                                        bot.NUMBER_BOX_OFFSETS)
         self.assertEqual(number, "")
+
+    def test_never_takes_the_previous_tickets_number_left_on_the_clipboard(self):
+        from unittest import mock
+        # Another program keeps the clipboard from being emptied, and Discord is slow to copy:
+        # the previous ticket's number is still there when the bot first looks
+        self.can_empty, self.board = False, "07 22 22 22 22"
+        reads = []
+
+        def read():
+            reads.append(self.board)
+            if len(reads) == 3:  # Discord's copy lands a moment after Ctrl+C
+                self.board = "06 12 36 54 85"
+            return self.board
+
+        with mock.patch.object(bot, "get_clipboard_text", read):
+            number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
+                                           bot.NUMBER_BOX_OFFSETS)
+        self.assertEqual(number, "06 12 36 54 85")
+
+
+class TestPastingIntoItunes(unittest.TestCase):
+    """After pasting, the field is read back: it must hold the new value, not the previous ticket's."""
+
+    def _paste(self, text, field="07 22 22 22 22", paste_fails=0, readable=True):
+        from unittest import mock
+        state = {"field": field, "board": "", "selected": False, "fails": paste_fails}
+
+        def hotkey(*keys):
+            if keys == ("ctrl", "a"):
+                state["selected"] = True
+            elif keys == ("ctrl", "v"):
+                if state["fails"]:
+                    state["fails"] -= 1  # the paste did not reach the field
+                else:
+                    state["field"] = state["board"]
+            elif keys == ("ctrl", "c") and state["selected"] and readable:
+                state["board"] = state["field"]
+
+        def press(key):
+            if key == "backspace" and state["selected"] and not state["fails"]:
+                state["field"] = ""
+            state["selected"] = False
+
+        with mock.patch.object(bot, "human_hotkey", hotkey), \
+             mock.patch.object(bot, "human_press", press), \
+             mock.patch.object(bot, "set_clipboard_text", lambda t: state.update(board=t)), \
+             mock.patch.object(bot, "get_clipboard_text", lambda: state["board"]), \
+             mock.patch.object(bot, "human_pause", lambda *a, **k: None), \
+             mock.patch.object(bot.time, "sleep", lambda s: None), \
+             mock.patch("builtins.print"):
+            return bot.replace_field_text(text), state["field"]
+
+    def test_pasted_value_is_checked(self):
+        self.assertEqual(self._paste("06 12 36 54 85"), (True, "06 12 36 54 85"))
+
+    def test_pastes_again_when_the_field_still_shows_the_old_number(self):
+        self.assertEqual(self._paste("06 12 36 54 85", paste_fails=1), (True, "06 12 36 54 85"))
+
+    def test_gives_up_when_the_field_keeps_the_old_number(self):
+        ok, field = self._paste("06 12 36 54 85", paste_fails=5)
+        self.assertFalse(ok)
+        self.assertEqual(field, "07 22 22 22 22")
+
+    def test_a_field_that_cannot_be_read_back_is_trusted(self):
+        self.assertEqual(self._paste("1122", field="", readable=False), (True, "1122"))
 
 
 class TestWaitForClaim(unittest.TestCase):
@@ -524,6 +602,17 @@ class TestBestMatch(unittest.TestCase):
         loc = bot.locate_element("itunes_didnt_get_code_link.png", confidence=0.80, screen=screen)
         self.assertEqual(loc, Point(693 + variant.width // 2, 279 + variant.height // 2))
         self.assertEqual(bot._variants("itunes_submit_btn.png"), ["itunes_submit_btn.png"])
+
+    def test_selected_input_fields_are_found_too(self):
+        from PIL import Image
+        # iTunes draws a thick dark border round the field that has the cursor: the plain crops score ~0.4
+        for name in ("itunes_enter_code_input.png", "itunes_phone_input.png"):
+            stem = name[:-4]
+            selected = Image.open(bot.img_path(stem + "@selected.png")).convert("RGB")
+            screen = Image.new("RGB", (1920, 1080), (255, 255, 255))
+            screen.paste(selected, (600, 300))
+            self.assertEqual(bot.locate_element(name, confidence=0.80, screen=screen),
+                             Point(600 + selected.width // 2, 300 + selected.height // 2), name)
 
     def test_nothing_found_returns_none(self):
         screen = self._screen_with([])
@@ -1217,7 +1306,7 @@ class TestOneTryWhileAnotherTicketWaits(_WorkState):
              mock.patch.object(bot, "claim_from_notification", lambda screen=None: False), \
              mock.patch.object(bot, "wait_for_element", lambda name, **k: Point(500, 300)), \
              mock.patch.object(bot, "human_click", lambda *a, **k: None), \
-             mock.patch.object(bot, "replace_field_text", lambda text: None), \
+             mock.patch.object(bot, "replace_field_text", lambda text: True), \
              mock.patch.object(bot, "human_scroll", lambda n: None), \
              mock.patch.object(bot, "remember_spot", lambda *a: None), \
              mock.patch.object(bot, "spot", lambda name: (580, 300)), \

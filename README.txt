@@ -46,7 +46,11 @@ ANOTHER PC:
 - Fonts: a PC can draw some text a pixel wider, so an image cropped on one PC
   can miss on another. Put a crop from that PC next to the original as
   images/<same name>@<anything>.png (e.g. itunes_didnt_get_code_link@1080p.png):
-  the bot then tries both.
+  the bot then tries both. The same is used for iTunes' Code and phone number
+  fields while they are selected (thick dark border): *@selected.png.
+- Copying: the bot never takes text that was already on the clipboard for a
+  new copy, and after pasting the number or code into iTunes it reads the
+  field back to check it holds that value (and pastes again if not).
 
 BACKUP CLICK SPOTS:
 If a button's image is missed, the bot clicks where it last saw that button

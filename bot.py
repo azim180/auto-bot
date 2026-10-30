@@ -790,25 +790,49 @@ def click_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=Fa
     return None
 
 
-def replace_field_text(text):
-    """Clears the focused input and pastes `text`."""
-    human_hotkey("ctrl", "a")
-    human_press("backspace")
-    set_clipboard_text(text)
-    human_hotkey("ctrl", "v")
-    human_pause(0.08, 0.15)
+def emptied_clipboard():
+    """
+    Empties the clipboard before copying. Returns what is still on it: normally "", but another
+    program can keep it, and that old text (say the previous ticket's number) must not be taken
+    for what is copied next.
+    """
+    set_clipboard_text("")
+    return get_clipboard_text().strip()
 
 
-def copy_selection(timeout=1.5):
-    """Presses Ctrl+C, then waits for the text to actually land on the clipboard."""
+def copy_selection(timeout=1.5, old=""):
+    """Presses Ctrl+C, then waits for the copied text (not `old`, what was there before) on the clipboard."""
     human_hotkey("ctrl", "c")
     start = time.time()
     while time.time() - start < timeout:
         text = get_clipboard_text().strip()
-        if text:
+        if text and text != old:
             return text
         time.sleep(0.05)
     return ""
+
+
+def replace_field_text(text):
+    """
+    Clears the focused input and pastes `text`, then reads the field back (select all, copy) to make
+    sure it holds `text` - not, say, the previous ticket's number. False if it still does not after
+    a second paste; True also when the field cannot be read back.
+    """
+    wanted = re.sub(r"\D", "", text).lstrip("0")
+    for attempt in (1, 2):
+        human_hotkey("ctrl", "a")
+        human_press("backspace")
+        set_clipboard_text(text)
+        human_hotkey("ctrl", "v")
+        human_pause(0.08, 0.15)
+        old = emptied_clipboard()
+        human_hotkey("ctrl", "a")
+        shown = copy_selection(timeout=0.8, old=old)
+        human_press("end")  # unselect
+        if not shown or not wanted or re.sub(r"\D", "", shown).lstrip("0") == wanted:
+            return True
+        print(f"[WARN] The field shows {shown!r} instead of {text!r} - pasting again (try {attempt}/2)")
+    return False
 
 
 # ==============================================================================
@@ -1278,9 +1302,9 @@ def copy_ticket_value(label_img, region, extract, default_offsets, require_box=F
             box = (label.x + px(default_offsets[0]), label.x + px(default_offsets[1]))
         left, right, y = box[0], box[1], label.y
 
-        set_clipboard_text("")
+        old = emptied_clipboard()
         human_click((left + right) / 2, y, clicks=2, jitter=1)
-        copied = copy_selection()
+        copied = copy_selection(old=old)
         human_click(label.x, label.y, jitter=1)  # clear the blue text selection
         value = extract(copied)
         if value:
@@ -1648,7 +1672,9 @@ def verify_with_itunes(ticket, phone_number):
         print("[WARN] Could not find iTunes' phone number field. Leaving this ticket for a human.")
         return False
     human_click(*phone_field)
-    replace_field_text(phone_number)
+    if not replace_field_text(phone_number):
+        print("[WARN] Could not get the phone number into iTunes. Leaving this ticket for a human.")
+        return False
 
     # Scroll down and click Submit
     human_scroll(-5)
@@ -1706,7 +1732,9 @@ def verify_with_itunes(ticket, phone_number):
             print("[WARN] Could not find iTunes' code field. Leaving this ticket for a human.")
             return False
         human_click(*code_field)
-        replace_field_text(code)
+        if not replace_field_text(code):
+            print("[WARN] Could not get the code into iTunes. Leaving this ticket for a human.")
+            return False
 
         click_itunes_submit("itunes_submit_code")
 
