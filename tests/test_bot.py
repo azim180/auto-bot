@@ -191,6 +191,9 @@ class TestValueExtraction(unittest.TestCase):
             "Number \u2192 06 12 36 54 85": "06 12 36 54 85",
             "+33 6 12 34 56 78": "+33 6 12 34 56 78",
             "0612365485": "0612365485",
+            "06\u00a012\u00a036\u00a054\u00a085": "06 12 36 54 85",
+            "06\u202f12\u202f36\u202f54\u202f85": "06 12 36 54 85",
+            "\u200b06 12 36 54 85\u200b": "06 12 36 54 85",
         }
         for text, expected in cases.items():
             self.assertEqual(bot.extract_phone(text), expected, text)
@@ -242,22 +245,30 @@ class TestCopyTicketValue(unittest.TestCase):
     def test_double_clicks_the_middle_of_the_code_box(self):
         self.clipboard = ["1122"]
         code = bot.copy_ticket_value("discord_code_label.png", (0, 0, 400, 200), bot.extract_code,
-                                     bot.CODE_BOX_OFFSETS, drag_fallback=False)
+                                     bot.CODE_BOX_OFFSETS)
         self.assertEqual(code, "1122")
         self.assertEqual(self.clicks, [2])
         self.assertEqual(self.drags, [])
         self.assertLessEqual(abs(self.moves[0][0] - 186), 1)
 
-    def test_spaced_number_falls_back_to_dragging_the_whole_box(self):
-        self.clipboard = ["36", "06 12 36 54 85"]
+    def test_double_click_copies_the_whole_number_without_dragging(self):
+        self.clipboard = ["06\u00a012\u00a036\u00a054\u00a085"]
         number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
                                        bot.NUMBER_BOX_OFFSETS)
         self.assertEqual(number, "06 12 36 54 85")
         self.assertEqual(self.clicks, [2])
-        self.assertEqual(self.drags, [(226, 120)])
+        self.assertEqual(self.drags, [])
+
+    def test_bad_copy_retries_with_another_double_click(self):
+        self.clipboard = ["Number", "06 12 36 54 85"]
+        number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
+                                       bot.NUMBER_BOX_OFFSETS)
+        self.assertEqual(number, "06 12 36 54 85")
+        self.assertEqual(self.clicks, [2, 2])
+        self.assertEqual(self.drags, [])
 
     def test_gives_up_with_empty_string(self):
-        self.clipboard = ["36", "36", "54", "54"]
+        self.clipboard = ["36", "54"]
         number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
                                        bot.NUMBER_BOX_OFFSETS)
         self.assertEqual(number, "")
