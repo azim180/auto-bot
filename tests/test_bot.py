@@ -120,7 +120,9 @@ class TestImgPath(unittest.TestCase):
 class TestEveryReferencedImageExists(unittest.TestCase):
     def test_all_images_used_by_bot_are_in_images_folder(self):
         import re
-        source = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.py")).read()
+        bot_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.py")
+        with open(bot_py, encoding="utf-8") as f:
+            source = f.read()
         names = set(re.findall(r'"([a-z0-9_]+\.png)"', source)) - {"debug_dropdown.png"}
         self.assertTrue(names)
         missing = sorted(n for n in names if not os.path.isfile(bot.img_path(n)))
