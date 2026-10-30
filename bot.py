@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import math
 import time
 import random
@@ -16,15 +17,22 @@ try:
 except ImportError:
     pyperclip = None
 
+try:
+    # Real pixels at any Windows display scaling (pyautogui does this too; it must happen first)
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 Point = collections.namedtuple("Point", "x y")
 
 # ==============================================================================
-# CONFIGURATION (Windows display scaling 100%)
+# CONFIGURATION (any screen resolution and Windows display scaling)
 # ==============================================================================
 pyautogui.FAILSAFE = True   # Slam mouse into any of the 4 screen corners to abort
 pyautogui.PAUSE = 0.03      # Base pause; the human_* helpers add small randomized waits on top
 
-IMAGES_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGES_DIR = os.path.join(BOT_DIR, "images")
 CONFIDENCE = 0.84
 # The "Add Payment Method" label left of the Add Payment button scores ~0.81 against it
 ADD_PAYMENT_CONFIDENCE = 0.88
@@ -40,7 +48,7 @@ EMBED_SETTLE_SECONDS = 0.35
 EMBED_UPDATE_TIMEOUT = 8
 
 # Inline-code box behind the Number / Code values, and where it sits relative to the
-# label's center when it cannot be detected (measured on the 1440x900 ticket embed)
+# label's center when it cannot be detected (measured on the ticket embed at 100% size)
 VALUE_BOX_RGB = (40, 41, 57)
 NUMBER_BOX_OFFSETS = (38, 110)
 CODE_BOX_OFFSETS = (31, 56)
@@ -49,37 +57,48 @@ CODE_BOX_OFFSETS = (31, 56)
 NOTIF_CLOSE_FROM_DOTS = (20, 0)
 NOTIF_CLOSE_FROM_HEADER = (288, 0)
 
-# Screen resolutions the bot can run on, chosen at startup. Each has its own images in
-# images/<name>/; an image missing there is borrowed from images/1440x900/ (at 100% display
-# scaling Discord and iTunes draw their buttons the same size on any screen).
-# "coords" are blind fallback clicks for when an image is not found. They were measured on
-# 1440x900 only, so other resolutions click only what they actually find on screen.
-BASE_PROFILE = "1440x900"
-PROFILES = {
-    "1440x900": {
-        "taskbar_discord_region": (450, 845, 200, 55),
-        "taskbar_itunes_region": (750, 845, 200, 55),
-        "coords": {
-            "taskbar_discord_right": (561, 878),
-            "taskbar_itunes": (870, 878),
-            "itunes_menu_account": (225, 53),
-            "itunes_manage_payments": (1020, 288),
-            "itunes_mobile_carrier": (730, 281),
-            "itunes_phone_input_box": (535, 330),
-            "itunes_submit_phone": (1207, 737),
-            "itunes_enter_code_box": (535, 253),
-            "itunes_didnt_get_code": (601, 299),
-            "itunes_submit_code": (1221, 375),
-        },
-    },
-    "1920x1080": {
-        "taskbar_discord_region": None,  # None = search the whole taskbar
-        "taskbar_itunes_region": None,
-        "coords": {},
+# Backup click spots for when a button's image is not found. These were measured on a 1440x900
+# screen at 100% scaling and are only used there; on any screen the bot also remembers where it
+# last saw each button (in learned_spots.json) and uses that instead.
+MEASURED_SPOTS = {
+    "1440x900@100": {
+        "taskbar_discord_right": (561, 878),
+        "taskbar_itunes": (870, 878),
+        "itunes_menu_account": (225, 53),
+        "itunes_manage_payments": (1020, 288),
+        "itunes_mobile_carrier": (730, 281),
+        "itunes_phone_input_box": (535, 330),
+        "itunes_submit_phone": (1207, 737),
+        "itunes_enter_code_box": (535, 253),
+        "itunes_didnt_get_code": (601, 299),
+        "itunes_submit_code": (1221, 375),
     },
 }
-profile_name = BASE_PROFILE
-PROFILE = PROFILES[BASE_PROFILE]
+# Where the taskbar icons are searched on that same 1440x900 screen (elsewhere: the whole taskbar)
+MEASURED_TASKBAR_REGIONS = {
+    "1440x900@100": {"discord": (450, 845, 200, 55), "itunes": (750, 845, 200, 55)},
+}
+SPOTS_FILE = os.path.join(BOT_DIR, "learned_spots.json")
+
+# The images were cropped at 100% display scaling. The screen resolution does not change how
+# big buttons are drawn, but Windows display scaling and Discord's zoom do, so the bot measures
+# each app's size from images that are always on screen while it is in front, and resizes the
+# images to match.
+UI_GROUPS = {"discord": "Discord", "itunes": "iTunes", "windows": "Taskbar/notifications"}
+SCALE_ANCHORS = {
+    "discord": ("discord_chat_input.png", "discord_claim_btn.png", "discord_action_dropdown.png"),
+    "itunes": ("itunes_menu_account.png", "itunes_phone_input.png", "itunes_add_payment_btn.png",
+               "itunes_submit_btn.png"),
+    "windows": ("taskbar_discord_right.png", "taskbar_itunes.png"),
+}
+# Discord's zoom levels (Ctrl +/-), tried on top of the display scaling, nearest first
+ZOOM_STEPS = (1.0, 0.9, 1.1, 0.8, 1.25, 0.75, 1.5, 0.67, 1.75, 0.5, 2.0)
+# A resized image never matches quite as well as one cropped at that size
+SCALED_CONFIDENCE_DROP = 0.03
+# A size is only adopted when one of its app's anchor images matches at least this well there
+SCALE_ADOPT_CONFIDENCE = 0.85
+CALIBRATION_RETRY_SECONDS = 30
+MAX_CALIBRATION_SEARCHES = 3  # then it stays at the display scaling
 
 # Track the last time the iTunes Account -> Manage Payments -> Mobile Carrier cycle ran
 last_itunes_cycle_time = time.time()
@@ -89,22 +108,7 @@ last_itunes_cycle_time = time.time()
 # HELPER FUNCTIONS
 # ==============================================================================
 def img_path(filename):
-    """The active resolution's copy of an image, or the 1440x900 one if it has none."""
-    own = os.path.join(IMAGES_ROOT, profile_name, filename)
-    if profile_name == BASE_PROFILE or os.path.exists(own):
-        return own
-    return os.path.join(IMAGES_ROOT, BASE_PROFILE, filename)
-
-
-def select_profile(name):
-    global profile_name, PROFILE
-    profile_name, PROFILE = name, PROFILES[name]
-    _templates.clear()
-
-
-def coord(name):
-    """Measured fallback click spot for the active resolution, or None if there is none."""
-    return PROFILE["coords"].get(name)
+    return os.path.join(IMAGES_DIR, filename)
 
 
 def screen_size():
@@ -114,12 +118,78 @@ def screen_size():
         return (1440, 900)
 
 
-def taskbar_region(key):
-    region = PROFILE[key]
+def display_scale():
+    """Windows display scaling (1.0 = 100%)."""
+    try:
+        return ctypes.windll.user32.GetDpiForSystem() / 96.0
+    except Exception:
+        return 1.0
+
+
+def screen_key():
+    """This screen's resolution and display scaling, like "1920x1080@100"."""
+    return "%dx%d@%d" % (*screen_size(), round(display_scale() * 100))
+
+
+def taskbar_region(app):
+    """Where to look for an app's taskbar icon: the measured area on 1440x900, else the whole taskbar."""
+    region = MEASURED_TASKBAR_REGIONS.get(screen_key(), {}).get(app)
     if region:
         return region
     screen_w, screen_h = screen_size()
-    return (0, screen_h - 60, screen_w, 60)
+    height = min(screen_h, px(60, "windows"))
+    return (0, screen_h - height, screen_w, height)
+
+
+# ------------------------------------------------------------------------------
+# Backup click spots: measured ones on 1440x900, plus where each button was last seen
+# ------------------------------------------------------------------------------
+_spots = None
+
+
+def _read_spots_file():
+    try:
+        with open(SPOTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _known_spots():
+    global _spots
+    if _spots is None:
+        _spots = {name: tuple(xy) for name, xy in MEASURED_SPOTS.get(screen_key(), {}).items()}
+        try:
+            learned = _read_spots_file().get(screen_key(), {})
+            _spots.update({name: (int(xy[0]), int(xy[1])) for name, xy in learned.items()})
+        except Exception:
+            pass
+    return _spots
+
+
+def spot(name):
+    """Backup click spot for `name` on this screen, or None if it was never seen here."""
+    return _known_spots().get(name) if name else None
+
+
+def remember_spot(name, loc):
+    """Remembers where a button was found, so it can still be clicked if its image is missed later."""
+    if not name or not loc:
+        return
+    spots = _known_spots()
+    xy = (int(loc[0]), int(loc[1]))
+    old = spots.get(name)
+    if old and abs(old[0] - xy[0]) <= 3 and abs(old[1] - xy[1]) <= 3:
+        return
+    spots[name] = xy
+    try:
+        data = _read_spots_file()
+        data.setdefault(screen_key(), {})[name] = list(xy)
+        with open(SPOTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except Exception:
+        pass
 
 
 def get_active_window_title():
@@ -188,16 +258,49 @@ def extract_code(text):
 
 
 def screen_area_around(x, y, left=120, up=220, right=260, down=40):
+    """Screen area around a point on Discord; the distances are at 100% size."""
     try:
         screen_w, screen_h = pyautogui.size()
     except Exception:
         screen_w, screen_h = 1440, 900
-    x0, y0 = max(0, int(x) - left), max(0, int(y) - up)
-    x1, y1 = min(screen_w, int(x) + right), min(screen_h, int(y) + down)
+    x0, y0 = max(0, int(x) - px(left)), max(0, int(y) - px(up))
+    x1, y1 = min(screen_w, int(x) + px(right)), min(screen_h, int(y) + px(down))
     return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
+# ==============================================================================
+# FINDING IMAGES ON SCREEN (at whatever size each app is drawn)
+# ==============================================================================
+ui_scale = dict.fromkeys(UI_GROUPS, 1.0)  # how big each app is drawn, relative to the images
+scale_confirmed = set()                    # apps whose size has been measured
+_last_calibration = {}
+_calibration_searches = collections.Counter()
 _templates = {}
+_scaled_templates = {}
+
+
+def group_of(image_name):
+    """Which app an image belongs to; its size follows that app's zoom."""
+    for group in ("discord", "itunes"):
+        if image_name.startswith(group + "_"):
+            return group
+    return "windows"  # notif_* and taskbar_*
+
+
+def px(n, group="discord"):
+    """A distance measured at 100% size, at the size `group`'s app is drawn now."""
+    return int(round(n * ui_scale[group]))
+
+
+def reset_ui_scale():
+    """Starts every app at Windows' display scaling until it is measured."""
+    base = round(display_scale(), 3)
+    for group in UI_GROUPS:
+        ui_scale[group] = base
+    scale_confirmed.clear()
+    _last_calibration.clear()
+    _calibration_searches.clear()
+    _scaled_templates.clear()
 
 
 def _load_template(image_name):
@@ -207,9 +310,38 @@ def _load_template(image_name):
             # imdecode instead of imread so folders with non-ASCII names still work
             _templates[image_name] = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         else:
-            print(f"[WARN] Missing image: images/{profile_name}/{image_name}")
+            print(f"[WARN] Missing image: images/{image_name}")
             _templates[image_name] = None
     return _templates[image_name]
+
+
+def _bgr(image):
+    return cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def _soften(img, scale):
+    """Gray and slightly blurred: text drawn at another size then still matches a resized image."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    k = max(3, int(round(2 * scale)) | 1)
+    return cv2.GaussianBlur(gray, (k, k), 0)
+
+
+def _template_at(image_name, scale):
+    """The image resized to `scale` (and softened); exactly as cropped at 100%."""
+    key = (image_name, scale)
+    if key not in _scaled_templates:
+        template = _load_template(image_name)
+        if template is not None and scale != 1.0:
+            h, w = template.shape[:2]
+            size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+            interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+            template = _soften(cv2.resize(template, size, interpolation=interpolation), scale)
+        _scaled_templates[key] = template
+    return _scaled_templates[key]
+
+
+def _threshold(confidence, scale):
+    return confidence - SCALED_CONFIDENCE_DROP if scale != 1.0 else confidence
 
 
 def grab_screen():
@@ -221,24 +353,115 @@ def grab_screen():
 
 
 def _match_scores(image_name, region=None, screen=None):
-    """Template-matches an image against the screen (or `region`): (scores, x0, y0, w, h) or None."""
-    return _match(_load_template(image_name), region, screen)
+    """
+    Template-matches an image, at its app's current size, against the screen (or `region`):
+    (scores, x0, y0, w, h, scale) or None.
+    """
+    scale = ui_scale[group_of(image_name)]
+    found = _match(_template_at(image_name, scale), region, screen, soften=scale if scale != 1.0 else None)
+    return None if found is None else found + (scale,)
 
 
-def _match(template, region=None, screen=None):
+def _match(template, region=None, screen=None, soften=None):
     if template is None:
         return None
     if screen is not None:
         shot = screen.crop((region[0], region[1], region[0] + region[2], region[1] + region[3])) if region else screen
     else:
         shot = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
-    haystack = cv2.cvtColor(np.array(shot.convert("RGB")), cv2.COLOR_RGB2BGR)
+    haystack = _bgr(shot)
+    if soften:
+        haystack = _soften(haystack, soften)
     h, w = template.shape[:2]
     if haystack.shape[0] < h or haystack.shape[1] < w:
         return None
     scores = np.nan_to_num(cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED), nan=0.0, posinf=0.0, neginf=0.0)
     x0, y0 = (int(region[0]), int(region[1])) if region else (0, 0)
     return scores, x0, y0, w, h
+
+
+def _best_score(template, haystack):
+    if template is None or haystack.shape[0] < template.shape[0] or haystack.shape[1] < template.shape[1]:
+        return 0.0
+    scores = np.nan_to_num(cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED), nan=0.0, posinf=0.0, neginf=0.0)
+    return float(scores.max())
+
+
+def _scale_candidates():
+    """Display scaling first, then Discord's zoom steps on top of it."""
+    base, candidates = display_scale(), []
+    for zoom in ZOOM_STEPS:
+        scale = round(base * zoom, 3)
+        if scale not in candidates and 0.4 <= scale <= 3.0:
+            candidates.append(scale)
+    return candidates
+
+
+def _anchor_score(group, scale, haystack, half=False, enough=1.0):
+    """How well `group`'s best anchor image matches `haystack` at `scale` (stops once it is `enough`)."""
+    best = 0.0
+    size = scale / 2 if half else scale
+    if size != 1.0:
+        haystack = _soften(haystack, size)
+    for name in SCALE_ANCHORS[group]:
+        best = max(best, _best_score(_template_at(name, size), haystack))
+        if best >= enough:
+            break
+    return best
+
+
+def calibrate_scale(group, screen=None, search=True):
+    """
+    Measures how big `group`'s app is drawn, from images that are always on screen while it is in
+    front: first at Windows' display scaling, then (with `search`) at Discord's zoom steps.
+    True once the size is known. A search is tried at most every CALIBRATION_RETRY_SECONDS, and
+    only MAX_CALIBRATION_SEARCHES times.
+    """
+    if group in scale_confirmed:
+        return True
+    if search:
+        if _calibration_searches[group] >= MAX_CALIBRATION_SEARCHES:
+            return False
+        if time.time() - _last_calibration.get(group, -CALIBRATION_RETRY_SECONDS) < CALIBRATION_RETRY_SECONDS:
+            return False
+        _last_calibration[group] = time.time()
+    screen = screen if screen is not None else grab_screen()
+    if screen is None:
+        return False
+    haystack = _bgr(screen)
+    candidates = _scale_candidates()
+    expected = candidates[0]
+    enough = _threshold(CONFIDENCE, expected)
+    if _anchor_score(group, expected, haystack, enough=enough) >= enough:
+        return _adopt_scale(group, expected)
+    if not search:
+        return False
+    # Rank the other sizes on a half-size screenshot (4x faster), then check the best two properly
+    small = cv2.resize(haystack, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    ranked = sorted(candidates[1:], key=lambda s: _anchor_score(group, s, small, half=True), reverse=True)
+    best_score, best_scale = max((_anchor_score(group, s, haystack), s) for s in ranked[:2]) if ranked else (0, None)
+    if best_score >= SCALE_ADOPT_CONFIDENCE:
+        return _adopt_scale(group, best_scale)
+    _calibration_searches[group] += 1
+    if _calibration_searches[group] == MAX_CALIBRATION_SEARCHES:
+        print(f"[SCALE] Could not measure {UI_GROUPS[group]}'s size; keeping {ui_scale[group]:.0%}.")
+    return False
+
+
+def _note_match(image_name, score, scale):
+    """A clear match at an app's current size proves that size is right: no need to measure it."""
+    group = group_of(image_name)
+    if group not in scale_confirmed and score >= 0.9:
+        _adopt_scale(group, scale)
+
+
+def _adopt_scale(group, scale):
+    if ui_scale[group] != scale:
+        _scaled_templates.clear()
+    ui_scale[group] = scale
+    scale_confirmed.add(group)
+    print(f"[SCALE] {UI_GROUPS[group]} is drawn at {scale:.0%} size; images are matched at that size.")
+    return True
 
 
 def locate_box(image_name, confidence=CONFIDENCE, region=None, screen=None):
@@ -249,10 +472,11 @@ def locate_box(image_name, confidence=CONFIDENCE, region=None, screen=None):
         return None
     if found is None:
         return None
-    scores, x0, y0, w, h = found
+    scores, x0, y0, w, h, scale = found
     _, best, _, (x, y) = cv2.minMaxLoc(scores)
-    if best < confidence:
+    if best < _threshold(confidence, scale):
         return None
+    _note_match(image_name, best, scale)
     return (x0 + int(x), y0 + int(y), w, h)
 
 
@@ -271,7 +495,7 @@ def locate_template(template, confidence, region=None, screen=None):
 
 def grab_bgr(region):
     try:
-        return cv2.cvtColor(np.array(pyautogui.screenshot(region=region).convert("RGB")), cv2.COLOR_RGB2BGR)
+        return _bgr(pyautogui.screenshot(region=region))
     except Exception:
         return None
 
@@ -292,14 +516,15 @@ def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=F
         return None
     if found is None:
         return None
-    scores, x0, y0, w, h = found
-    ys, xs = np.where(scores >= confidence)
+    scores, x0, y0, w, h, scale = found
+    ys, xs = np.where(scores >= _threshold(confidence, scale))
     if len(ys) == 0:
         return None
     # Best-scoring spot within the lowest match (matches spread over a few pixels)
     lowest = ys >= ys.max() - h // 2
     i = int(np.argmax(scores[ys[lowest], xs[lowest]]))
     x, y = int(xs[lowest][i]), int(ys[lowest][i])
+    _note_match(image_name, float(scores[y, x]), scale)
     return Point(x0 + x + w // 2, y0 + y + h // 2)
 
 
@@ -378,19 +603,24 @@ def human_scroll(notches):
     human_pause(0.12, 0.22)
 
 
-def click_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False, fallback_coord=None, timeout=0):
-    """Finds (waiting up to `timeout`s) and clicks an image, or uses fallback_coord if provided."""
+def click_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False, spot_name=None, timeout=0):
+    """
+    Finds (waiting up to `timeout`s) and clicks an image. With `spot_name`, where it was found is
+    remembered, and if it is not found the remembered (or measured) spot is clicked instead.
+    """
     if timeout:
         loc = wait_for_element(image_name, timeout=timeout, confidence=confidence, pick_bottom=pick_bottom, region=region)
     else:
         loc = locate_element(image_name, confidence=confidence, region=region, pick_bottom=pick_bottom)
     if loc:
+        remember_spot(spot_name, loc)
         human_click(loc.x, loc.y)
         return loc
-    if fallback_coord:
-        print(f"[INFO] Using 1440x900 fallback coordinate {fallback_coord} for {image_name}")
-        human_click(*fallback_coord)
-        return fallback_coord
+    backup = spot(spot_name)
+    if backup:
+        print(f"[INFO] {image_name} not found; clicking where it was before {backup}")
+        human_click(*backup)
+        return backup
     return None
 
 
@@ -498,38 +728,49 @@ def wait_for_window(name, timeout=4):
     return False
 
 
+def _click_taskbar_icon(app, image_name, spot_name):
+    """Clicks an app's taskbar icon. False if it cannot be found."""
+    calibrate_scale("windows")
+    loc = locate_element(image_name, confidence=0.80, region=taskbar_region(app))
+    if loc:
+        remember_spot(spot_name, loc)
+    target = loc or spot(spot_name)
+    if not target:
+        return False
+    human_click(*target)
+    return True
+
+
 def switch_to_discord():
     """Brings the Right Discord instance to the foreground without minimizing it."""
     title = get_active_window_title()
     if "Discord" in title or locate_element("discord_chat_input.png", confidence=0.80):
+        calibrate_scale("discord")
         return
     print("[SWITCH] Clicking Right Discord icon on taskbar...")
-    loc = locate_element("taskbar_discord_right.png", confidence=0.80, region=taskbar_region("taskbar_discord_region"))
-    target = loc or coord("taskbar_discord_right")
-    if not target:
+    if not _click_taskbar_icon("discord", "taskbar_discord_right.png", "taskbar_discord_right"):
         print("[WARN] Could not find the Discord icon on the taskbar")
         return
-    human_click(*target)
     if not wait_for_window("Discord"):
         print("[WARN] Discord window did not come to the front")
     human_pause(0.12, 0.25)  # let it repaint
+    calibrate_scale("discord")
 
 
 def switch_to_itunes():
     """Brings iTunes to the foreground from minimized/background state."""
     title = get_active_window_title()
     if "iTunes" in title or locate_element("itunes_menu_account.png", confidence=0.82):
+        calibrate_scale("itunes")
         return
     print("[SWITCH] Clicking iTunes icon on taskbar...")
-    loc = locate_element("taskbar_itunes.png", confidence=0.80, region=taskbar_region("taskbar_itunes_region"))
-    target = loc or coord("taskbar_itunes")
-    if not target:
+    if not _click_taskbar_icon("itunes", "taskbar_itunes.png", "taskbar_itunes"):
         print("[WARN] Could not find the iTunes icon on the taskbar")
         return
-    human_click(*target)
     if not wait_for_window("iTunes"):
         print("[WARN] iTunes window did not come to the front")
     human_pause(0.15, 0.3)  # let it repaint
+    calibrate_scale("itunes")
 
 
 def notification_area():
@@ -558,47 +799,78 @@ def open_ticket_from_notification(screen=None):
     return False
 
 
-def close_notifications(max_rounds=5):
+def find_notification(screen=None):
+    """Where to click to close the Windows notification showing in the corner, or None if there is none."""
+    area = notification_area()
+    screen = screen if screen is not None else grab_screen()
+    loc = locate_element("notif_close_btn.png", confidence=0.80, region=area, screen=screen)
+    if loc:
+        return (loc.x + px(NOTIF_CLOSE_FROM_DOTS[0], "windows"), loc.y + px(NOTIF_CLOSE_FROM_DOTS[1], "windows"))
+    # The X may only show on hover; it always sits at the same spot on the toast's top row
+    header = locate_element("notif_discord_header.png", confidence=0.80, region=area, screen=screen)
+    if header:
+        return (header.x + px(NOTIF_CLOSE_FROM_HEADER[0], "windows"), header.y + px(NOTIF_CLOSE_FROM_HEADER[1], "windows"))
+    return None
+
+
+def close_notifications(max_rounds=6):
     """
-    Closes Windows notifications in the bottom-right corner by their X, again while new ones
-    keep popping up. Returns how many were closed.
+    Closes Windows notifications in the bottom-right corner by their X, one after another while
+    new ones keep sliding in. Returns how many were closed.
     """
     area = notification_area()
     closed = 0
     for _ in range(max_rounds):
-        screen = grab_screen()
-        loc = locate_element("notif_close_btn.png", confidence=0.80, region=area, screen=screen)
-        if loc:
-            target = (loc.x + NOTIF_CLOSE_FROM_DOTS[0], loc.y + NOTIF_CLOSE_FROM_DOTS[1])
-        else:
-            # The X may only show on hover; it always sits at the same spot on the toast's top row
-            header = locate_element("notif_discord_header.png", confidence=0.80, region=area, screen=screen)
-            if not header:
-                break
-            target = (header.x + NOTIF_CLOSE_FROM_HEADER[0], header.y + NOTIF_CLOSE_FROM_HEADER[1])
+        # Notifications slide in, and the rest move up when one closes: look once it is still,
+        # or the X is clicked where it was a moment ago (that opens Discord instead)
+        wait_for_screen_settle(area, settle=0.25, timeout=2, interval=0.05)
+        target = find_notification()
+        if not target:
+            break
         human_click(*target, jitter=1)
         closed += 1
-        human_pause(0.3, 0.45)  # let it slide away before looking again
     if closed:
         print(f"[NOTIFY] Closed {closed} notification(s) that could cover iTunes")
     return closed
 
 
-def click_itunes_submit(fallback_coord):
+def click_itunes_submit(spot_name):
     """
-    Clicks iTunes' Submit. A Windows notification can pop up right over it, so notifications are
-    closed first; if one still caught the click (that brings Discord to the front), go back to
-    iTunes and try again.
+    Clicks iTunes' Submit. Windows notifications pop up over it, often several in a row, so they
+    are closed first and the click only happens while none is showing (one that slides in while
+    the mouse is on its way is closed too). If one still caught the click, which brings Discord to
+    the front, go back to iTunes and try again.
     """
-    for _ in range(3):
+    misses = 0
+    for _ in range(8):
         close_notifications()
-        if not click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=fallback_coord, timeout=3):
-            print("[WARN] Could not find iTunes' Submit button")
-            return False
+        loc = wait_for_element("itunes_submit_btn.png", timeout=1.5, confidence=0.82)
+        if loc:
+            remember_spot(spot_name, loc)
+        elif find_notification():
+            continue  # another notification slid in over it: close that one too
+        elif "Discord" in get_active_window_title():
+            switch_to_itunes()
+            continue
+        else:
+            misses += 1
+            loc = spot(spot_name)
+            if not loc:
+                if misses < 2:
+                    continue
+                print("[WARN] Could not find iTunes' Submit button")
+                return False
+            print(f"[INFO] Submit button not seen; clicking where it was before {loc}")
+        human_move(*loc, jitter=1)
+        if find_notification():
+            continue  # one popped up while the mouse was on its way
+        pyautogui.click()
+        human_pause(0.05, 0.12)
         if not wait_for_window("Discord", timeout=0.5):
             return True
         print("[WARN] A notification caught the Submit click and opened Discord; going back to iTunes...")
         switch_to_itunes()
+    print("[WARN] Notifications kept covering iTunes' Submit button")
     return False
 
 
@@ -626,16 +898,14 @@ def run_itunes_reset_cycle(return_to_discord=True):
     else:
         if not wait_for_element("itunes_account_settings_header.png", timeout=1.5, confidence=0.82):
             print("[ITUNES CYCLE] Clicking Account -> View My Account...")
-            click_element("itunes_menu_account.png", fallback_coord=coord("itunes_menu_account"))
-            if not click_element("itunes_menu_view_account.png", timeout=4):
+            account = click_element("itunes_menu_account.png", spot_name="itunes_menu_account")
+            if not click_element("itunes_menu_view_account.png", timeout=4) and account:
                 # Fallback: View My Account is ~70px below Account menu
-                account = coord("itunes_menu_account")
-                if account:
-                    human_click(account[0] + 20, account[1] + 72)
+                human_click(account[0] + px(20, "itunes"), account[1] + px(72, "itunes"))
 
         if wait_for_element("itunes_manage_payments_link.png", timeout=10):
             print("[ITUNES CYCLE] Clicking Manage Payments...")
-            click_element("itunes_manage_payments_link.png", fallback_coord=coord("itunes_manage_payments"))
+            click_element("itunes_manage_payments_link.png", spot_name="itunes_manage_payments")
 
         # Manage Payments shows either the existing list ("Add Payment") or the payment-type picker
         page = wait_for_any([("itunes_add_payment_btn.png", ADD_PAYMENT_CONFIDENCE), ("itunes_mobile_carrier_icon.png", CONFIDENCE)], timeout=10)
@@ -646,7 +916,7 @@ def run_itunes_reset_cycle(return_to_discord=True):
     # Select Mobile Carrier icon, then wait for the phone form to load
     if wait_for_element("itunes_mobile_carrier_icon.png", timeout=10):
         print("[ITUNES CYCLE] Selecting Mobile Carrier icon...")
-        click_element("itunes_mobile_carrier_icon.png", fallback_coord=coord("itunes_mobile_carrier"))
+        click_element("itunes_mobile_carrier_icon.png", spot_name="itunes_mobile_carrier")
         wait_for_element("itunes_phone_input.png", timeout=8, confidence=0.80)
     else:
         print("[WARN] Mobile Carrier option did not show up")
@@ -664,10 +934,10 @@ def run_itunes_reset_cycle(return_to_discord=True):
 # ==============================================================================
 def find_value_box(label):
     """Returns (left, right) of the grey inline-code box to the right of a `Label →`, or None."""
-    probe_y = int(label.y) - 5  # top padding row of the box: solid colour, no text
+    probe_y = int(label.y) - px(5)  # top padding row of the box: solid colour, no text
     x0 = int(label.x)
     try:
-        raw = pyautogui.screenshot(region=(x0, probe_y, 260, 1)).convert("RGB").tobytes()
+        raw = pyautogui.screenshot(region=(x0, probe_y, px(260), 1)).convert("RGB").tobytes()
     except Exception:
         return None
     br, bg, bb = VALUE_BOX_RGB
@@ -678,7 +948,7 @@ def find_value_box(label):
         if inside and run_start is None:
             run_start = i
         elif not inside and run_start is not None:
-            if i - run_start >= 10:
+            if i - run_start >= px(10):
                 return (x0 + run_start, x0 + i - 1)
             run_start = None
     return None
@@ -701,7 +971,7 @@ def copy_ticket_value(label_img, region, extract, default_offsets, require_box=F
         if box is None:
             if require_box:
                 return ""
-            box = (label.x + default_offsets[0], label.x + default_offsets[1])
+            box = (label.x + px(default_offsets[0]), label.x + px(default_offsets[1]))
         left, right, y = box[0], box[1], label.y
 
         set_clipboard_text("")
@@ -808,21 +1078,21 @@ def has_returning_user_warning(embed_region):
     left, top, width, height = box
     # ⚠️ is too small a part of the line for template matching to tell apart, so count
     # its yellow pixels in the strip just right of the ✅ instead.
-    strip = (left + width, max(0, top - 2), 20, height + 4)
+    strip = (left + width, max(0, top - px(2)), px(20), height + px(4))
     try:
         raw = pyautogui.screenshot(region=strip).convert("RGB").tobytes()
     except Exception:
         return False
     yellow = sum(1 for r, g, b in zip(raw[0::3], raw[1::3], raw[2::3]) if r > 180 and g > 140 and b < 90)
-    return yellow >= 8
+    return yellow >= max(4, round(8 * ui_scale["discord"] ** 2))
 
 
 # ==============================================================================
 # FOLLOWING ONE TICKET
 # ==============================================================================
 USER_LEFT = "user left"
-# The ticket's lines and buttons, measured from the center of its phone-number box: Code label
-# ~43px below, buttons ~81px, Action ~115px. The next ticket's lines start ~200px further down.
+# The ticket's lines and buttons, measured (at 100% size) from the center of its phone-number box:
+# Code label ~43px below, buttons ~81px, Action ~115px. The next ticket's lines start ~200px further down.
 TICKET_AREA = dict(left=220, up=40, right=330, down=175)
 
 
@@ -833,7 +1103,7 @@ class Ticket:
     """
 
     def __init__(self, left, right, y):
-        self.fingerprint = grab_bgr((int(left), int(y) - 6, int(right - left) + 1, 13))
+        self.fingerprint = grab_bgr((int(left), int(y) - px(6), int(right - left) + 1, px(13)))
         self.center = Point(int(left + right) // 2, int(y))
         self.scrolled = 0  # wheel notches the chat was scrolled up to keep the ticket in view
 
@@ -918,7 +1188,7 @@ def process_ticket():
         return False
 
     # Check if the newest ticket has the special returning-user warning: Server -> ✅ ⚠️
-    embed_region = (max(0, int(claim_loc.x - 120)), max(0, int(claim_loc.y - 160)), 350, 160)
+    embed_region = (max(0, int(claim_loc.x) - px(120)), max(0, int(claim_loc.y) - px(160)), px(350), px(160))
     is_returning_user = has_returning_user_warning(embed_region)
 
     # Click Claim, then wait until the embed shows Claim -> @you and the Resend Code / Reject buttons
@@ -944,7 +1214,7 @@ def process_ticket():
     if not number_label:
         print("[WARN] Could not find the ticket's Number. Leaving this ticket for a human.")
         return False
-    box = find_value_box(number_label) or (number_label.x + NUMBER_BOX_OFFSETS[0], number_label.x + NUMBER_BOX_OFFSETS[1])
+    box = find_value_box(number_label) or (number_label.x + px(NUMBER_BOX_OFFSETS[0]), number_label.x + px(NUMBER_BOX_OFFSETS[1]))
     ticket = Ticket(box[0], box[1], number_label.y)
 
     if ticket.has_user_left():
@@ -975,7 +1245,9 @@ def verify_with_itunes(ticket, phone_number):
 
     # Click inside the +33 phone number field and paste as-is
     phone_loc = wait_for_element("itunes_phone_input.png", timeout=8, confidence=0.80)
-    phone_field = (phone_loc.x + 80, phone_loc.y) if phone_loc else coord("itunes_phone_input_box")
+    if phone_loc:
+        remember_spot("itunes_phone_input_box", (phone_loc.x + px(80, "itunes"), phone_loc.y))
+    phone_field = spot("itunes_phone_input_box")  # just found there, or where it was last time
     if not phone_field:
         print("[WARN] Could not find iTunes' phone number field. Leaving this ticket for a human.")
         return False
@@ -984,7 +1256,7 @@ def verify_with_itunes(ticket, phone_number):
 
     # Scroll down and click Submit
     human_scroll(-5)
-    click_itunes_submit(coord("itunes_submit_phone"))
+    click_itunes_submit("itunes_submit_phone")
 
     print("[ITUNES] Waiting for iTunes to send the code...")
     result = wait_for_any([
@@ -1029,14 +1301,16 @@ def verify_with_itunes(ticket, phone_number):
         # Switch to iTunes, enter the code, and click Submit
         switch_to_itunes()
         code_box = wait_for_element("itunes_enter_code_input.png", timeout=4, confidence=0.80)
-        code_field = (code_box.x + 30, code_box.y) if code_box else coord("itunes_enter_code_box")
+        if code_box:
+            remember_spot("itunes_enter_code_box", (code_box.x + px(30, "itunes"), code_box.y))
+        code_field = spot("itunes_enter_code_box")  # just found there, or where it was last time
         if not code_field:
             print("[WARN] Could not find iTunes' code field. Leaving this ticket for a human.")
             return False
         human_click(*code_field)
         replace_field_text(code)
 
-        click_itunes_submit(coord("itunes_submit_code"))
+        click_itunes_submit("itunes_submit_code")
 
         print("[ITUNES] Waiting for iTunes to check the code...")
         outcome = wait_for_any([
@@ -1053,7 +1327,7 @@ def verify_with_itunes(ticket, phone_number):
             if attempt == 1:
                 # 1st wrong code: click "Didn't get a verification code?" in iTunes
                 print("[RETRY] Clicking 'Didn't get a verification code?' in iTunes...")
-                click_element("itunes_didnt_get_code_link.png", confidence=0.80, fallback_coord=coord("itunes_didnt_get_code"), timeout=4)
+                click_element("itunes_didnt_get_code_link.png", confidence=0.80, spot_name="itunes_didnt_get_code", timeout=4)
 
                 # After a code was submitted the ticket only offers Resend Code inside the Action menu
                 switch_to_discord()
@@ -1101,55 +1375,25 @@ def _cli_args():
     return [arg.strip() for arg in sys.argv[1:]]
 
 
-def ask_resolution():
-    """Which images/<resolution> folder to use: `python bot.py 1920x1080`, or asked at startup."""
-    names = list(PROFILES)
-    for arg in _cli_args():
-        if arg in PROFILES:
-            return arg
-    detected = "%dx%d" % screen_size()
-    if detected not in PROFILES:
-        # Any other screen works the same way as 1920x1080: borrowed images, only clicks what it sees
-        PROFILES[detected] = {"taskbar_discord_region": None, "taskbar_itunes_region": None, "coords": {}}
-        names.append(detected)
-    default = detected
-    print("Screen resolution:")
-    for i, name in enumerate(names, 1):
-        print(f"  {i}) {name}" + ("   <- this screen" if name == detected else ""))
-    while True:
-        try:
-            answer = input(f"Choose 1-{len(names)} (Enter = {default}): ").strip()
-        except EOFError:
-            return default
-        if not answer:
-            return default
-        if answer.isdigit() and 1 <= int(answer) <= len(names):
-            return names[int(answer) - 1]
-        if answer in PROFILES:
-            return answer
-        print(f"Please type a number from 1 to {len(names)}, or just press Enter.")
-
-
-def describe_profile():
-    own_dir = os.path.join(IMAGES_ROOT, profile_name)
-    own = [f for f in os.listdir(own_dir) if f.endswith(".png")] if os.path.isdir(own_dir) else []
-    note = "" if profile_name == BASE_PROFILE else f", the rest borrowed from {BASE_PROFILE}"
-    print(f"[SETUP] Resolution {profile_name}: {len(own)} image(s) of its own{note}.")
-    detected = "%dx%d" % screen_size()
-    if detected != profile_name:
-        print(f"[WARN] This screen is {detected}, not {profile_name}; images and click spots may not line up.")
+def startup_check():
+    """Says what the bot is working with, and measures how big each app on screen is drawn."""
+    reset_ui_scale()
+    screen_w, screen_h = screen_size()
     scale = display_scale()
+    print(f"[SETUP] Screen {screen_w}x{screen_h}, Windows display scaling {scale:.0%}.")
     if abs(scale - 1.0) > 0.01:
-        print(f"[WARN] Windows display scaling is {scale:.0%}. The images are made at 100%, so buttons will not "
-              "be found: set Settings > System > Display > Scale to 100%.")
-
-
-def display_scale():
-    """Windows display scaling (1.0 = 100%)."""
-    try:
-        return ctypes.windll.user32.GetDpiForSystem() / 96.0
-    except Exception:
-        return 1.0
+        print("[SETUP] The images were cropped at 100%, so they are resized to match. If buttons are "
+              "missed, 100% (Settings > System > Display > Scale) is the most reliable.")
+    missing = [name for name in sorted(set(sum(SCALE_ANCHORS.values(), ()))) if not os.path.exists(img_path(name))]
+    if missing:
+        print(f"[WARN] Missing images in images/: {', '.join(missing)}")
+    spots = _known_spots()
+    print(f"[SETUP] Backup click spots for this screen: {len(spots)}" +
+          ("" if spots else " yet (it remembers where it finds each button)."))
+    screen = grab_screen()
+    for group in UI_GROUPS:
+        if not calibrate_scale(group, screen, search=(group == "windows")):
+            print(f"[SCALE] {UI_GROUPS[group]} is not on screen yet; its size is measured as soon as it is.")
 
 
 def ask_verification_limit():
@@ -1184,15 +1428,14 @@ def send_done_message():
 def main():
     global last_itunes_cycle_time
     print("==================================================================")
-    print("  DISCORD <-> ITUNES VISUAL AUTOMATION BOT (display scaling 100%)")
+    print("  DISCORD <-> ITUNES VISUAL AUTOMATION BOT")
     print("  Safety Abort: Slam mouse into ANY of the 4 screen corners.")
     print("==================================================================")
-    select_profile(ask_resolution())
-    describe_profile()
     limit = ask_verification_limit()
     print(f"[SETUP] Will stop after {limit} verification(s)." if limit else "[SETUP] No limit - runs until you close it.")
     print("Starting in 3 seconds...")
     time.sleep(3)
+    startup_check()
 
     verified = 0
     last_itunes_cycle_time = time.time()
