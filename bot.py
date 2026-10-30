@@ -222,7 +222,10 @@ def grab_screen():
 
 def _match_scores(image_name, region=None, screen=None):
     """Template-matches an image against the screen (or `region`): (scores, x0, y0, w, h) or None."""
-    template = _load_template(image_name)
+    return _match(_load_template(image_name), region, screen)
+
+
+def _match(template, region=None, screen=None):
     if template is None:
         return None
     if screen is not None:
@@ -251,6 +254,26 @@ def locate_box(image_name, confidence=CONFIDENCE, region=None, screen=None):
     if best < confidence:
         return None
     return (x0 + int(x), y0 + int(y), w, h)
+
+
+def locate_template(template, confidence, region=None, screen=None):
+    """Center of the best match of an in-memory BGR image on screen, or None below `confidence`."""
+    try:
+        found = _match(template, region, screen)
+    except Exception:
+        return None
+    if found is None:
+        return None
+    scores, x0, y0, w, h = found
+    _, best, _, (x, y) = cv2.minMaxLoc(scores)
+    return Point(x0 + int(x) + w // 2, y0 + int(y) + h // 2) if best >= confidence else None
+
+
+def grab_bgr(region):
+    try:
+        return cv2.cvtColor(np.array(pyautogui.screenshot(region=region).convert("RGB")), cv2.COLOR_RGB2BGR)
+    except Exception:
+        return None
 
 
 def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False, screen=None):
@@ -684,6 +707,7 @@ def copy_ticket_value(label_img, region, extract, default_offsets, require_box=F
         set_clipboard_text("")
         human_click((left + right) / 2, y, clicks=2, jitter=1)
         copied = copy_selection()
+        human_click(label.x, label.y, jitter=1)  # clear the blue text selection
         value = extract(copied)
         if value:
             return value
@@ -693,11 +717,14 @@ def copy_ticket_value(label_img, region, extract, default_offsets, require_box=F
     return ""
 
 
-def select_discord_action_menu_item(menu_item_img):
-    """Clicks the Action dropdown on the newest ticket and selects the specified option."""
+def select_discord_action_menu_item(menu_item_img, region=None):
+    """Clicks the Action dropdown (in `region`, else on the newest ticket) and selects the option."""
     switch_to_discord()
     print(f"[DISCORD] Opening Action dropdown for {menu_item_img}...")
-    action_loc = wait_for_element("discord_action_dropdown.png", timeout=8, confidence=0.80, pick_bottom=True)
+    if region:
+        action_loc = wait_for_element("discord_action_dropdown.png", timeout=8, confidence=0.80, region=region)
+    else:
+        action_loc = wait_for_element("discord_action_dropdown.png", timeout=8, confidence=0.80, pick_bottom=True)
     if not action_loc:
         print("[WARN] Could not find Action dropdown button")
         return False
@@ -718,12 +745,12 @@ def select_discord_action_menu_item(menu_item_img):
     return False
 
 
-def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=None):
+def wait_for_user_code(ticket, timeout=CODE_WAIT_TIMEOUT, previous_code=None):
     """
-    Waits up to `timeout` seconds (2 minutes) for the user to submit their verification code.
-    Watches for either the Windows notification (`notif_code_submitted.png`) or
-    the Discord embed updating to show `Mark as Verified` (`discord_mark_verified_btn.png`).
+    Waits up to `timeout` seconds (2 minutes) for the user to submit their verification code on
+    `ticket`: its "Mark as Verified" button appears and the Code shows 4 digits in its box.
     `previous_code` (the rejected one) is ignored while it is still showing on the ticket.
+    Returns the code, None on timeout, or USER_LEFT when the Code shows "❌Left".
     """
     print(f"[WAIT] Waiting up to {timeout}s for user to submit verification code...")
     start = time.time()
@@ -740,13 +767,19 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=None):
         if int(time.time() - start) % 4 == 0:
             switch_to_discord()
 
+        # Newer tickets may have pushed this one up: find it, then look only at its own lines
+        region = ticket.region()
+        if region is None:
+            time.sleep(0.5)
+            continue
+        if locate_element("discord_code_left.png", confidence=0.85, region=region):
+            return USER_LEFT
+
         # When a user submits a code, the green "Mark as Verified" button appears on the embed
-        mark_loc = locate_element("discord_mark_verified_btn.png", confidence=0.82, pick_bottom=True, screen=screen)
+        mark_loc = locate_element("discord_mark_verified_btn.png", confidence=0.82, region=region)
         if mark_loc:
             wait_for_screen_settle(screen_area_around(mark_loc.x, mark_loc.y), settle=0.2, timeout=2, interval=0.05)
-            # Only read the Code from the ticket this button belongs to
-            code_region = screen_area_around(mark_loc.x, mark_loc.y, left=200, up=160, right=250, down=0)
-            code = copy_ticket_value("discord_code_label.png", code_region, extract_code, CODE_BOX_OFFSETS,
+            code = copy_ticket_value("discord_code_label.png", region, extract_code, CODE_BOX_OFFSETS,
                                      require_box=True)
             if not code and not told_no_box:
                 print("[WAIT] Code is not in its box yet (timer showing); waiting for the 4-digit code...")
@@ -785,6 +818,89 @@ def has_returning_user_warning(embed_region):
 
 
 # ==============================================================================
+# FOLLOWING ONE TICKET
+# ==============================================================================
+USER_LEFT = "user left"
+# The ticket's lines and buttons, measured from the center of its phone-number box: Code label
+# ~43px below, buttons ~81px, Action ~115px. The next ticket's lines start ~200px further down.
+TICKET_AREA = dict(left=220, up=40, right=330, down=175)
+
+
+class Ticket:
+    """
+    The ticket being worked on. Newer tickets push it up the chat or off screen, so it is found
+    again by a snapshot of its phone-number box, and its buttons are only looked for right there.
+    """
+
+    def __init__(self, left, right, y):
+        self.fingerprint = grab_bgr((int(left), int(y) - 6, int(right - left) + 1, 13))
+        self.center = Point(int(left + right) // 2, int(y))
+        self.scrolled = 0  # wheel notches the chat was scrolled up to keep the ticket in view
+
+    def find(self):
+        """Where the ticket's number box is now, scrolling the chat up if newer messages hid it."""
+        if self.fingerprint is None:
+            return None
+        if "Discord" not in get_active_window_title():
+            switch_to_discord()
+        for attempt in range(8):
+            loc = locate_template(self.fingerprint, 0.93)
+            if loc:
+                self.center = loc
+                return loc
+            if attempt == 0:
+                print("[TICKET] Newer messages pushed the ticket out of view - scrolling up to it...")
+            human_move(self.center.x, screen_size()[1] // 2)
+            for _ in range(3):
+                pyautogui.scroll(120)
+                time.sleep(random.uniform(0.02, 0.05))
+            self.scrolled += 3
+            human_pause(0.25, 0.4)
+        print("[WARN] Lost track of the ticket")
+        return None
+
+    def region(self):
+        """Screen area holding this ticket's Code line and buttons (not the next ticket's)."""
+        loc = self.find()
+        return screen_area_around(loc.x, loc.y, **TICKET_AREA) if loc else None
+
+    def has_user_left(self):
+        region = self.region()
+        return bool(region and locate_element("discord_code_left.png", confidence=0.85, region=region))
+
+    def click_button(self, image_name, what, confidence=0.82, timeout=3):
+        """Clicks one of this ticket's buttons. False if it is not there."""
+        switch_to_discord()
+        region = self.region()
+        loc = region and wait_for_element(image_name, timeout=timeout, confidence=confidence, region=region)
+        if not loc:
+            return False
+        click_and_wait_for_update(loc.x, loc.y, what)
+        return True
+
+    def choose_action(self, menu_item_img):
+        """Action -> `menu_item_img` on this ticket. False if it could not be done."""
+        switch_to_discord()
+        region = self.region()
+        if not region:
+            print(f"[WARN] Could not find the ticket to choose {menu_item_img}")
+            return False
+        return select_discord_action_menu_item(menu_item_img, region=region)
+
+    def back_to_bottom(self):
+        """Scrolls the chat back down if it was scrolled up to follow this ticket."""
+        if not self.scrolled:
+            return
+        switch_to_discord()
+        human_move(self.center.x, screen_size()[1] // 2)
+        for _ in range(self.scrolled + 15):
+            pyautogui.scroll(-120)
+            time.sleep(random.uniform(0.01, 0.03))
+        self.scrolled = 0
+        human_pause(0.2, 0.35)
+
+
+# ==============================================================================
 # MAIN TICKET WORKFLOW
 # ==============================================================================
 def process_ticket():
@@ -817,17 +933,39 @@ def process_ticket():
     # SPECIAL CASE: Server -> ✅ ⚠️ (Claim -> Action -> Mark as Verified immediately)
     if is_returning_user:
         print("[SPECIAL CASE] Returning user (✅ ⚠️) detected! Marking as Verified via Action menu...")
-        select_discord_action_menu_item("discord_menu_mark_verified.png")
+        select_discord_action_menu_item("discord_menu_mark_verified.png",
+                                        region=screen_area_around(anchor.x, anchor.y, left=250, up=60, right=300, down=80))
+        return False
+
+    # Remember this ticket by its number box (before the copy selects it), so it can be found again
+    number_region = screen_area_around(anchor.x, anchor.y, left=250, up=170, right=250, down=0)
+    number_label = wait_for_element("discord_number_label.png", timeout=3, confidence=0.82, pick_bottom=True,
+                                    region=number_region)
+    if not number_label:
+        print("[WARN] Could not find the ticket's Number. Leaving this ticket for a human.")
+        return False
+    box = find_value_box(number_label) or (number_label.x + NUMBER_BOX_OFFSETS[0], number_label.x + NUMBER_BOX_OFFSETS[1])
+    ticket = Ticket(box[0], box[1], number_label.y)
+
+    if ticket.has_user_left():
+        print("[LEFT] The user already left. Skipping this ticket and waiting for the next one.")
         return False
 
     # Copy the phone number as-is (leading 0 and spaces are fine, iTunes strips spaces automatically)
-    number_region = screen_area_around(anchor.x, anchor.y, left=250, up=170, right=250, down=0)
     phone_number = copy_ticket_value("discord_number_label.png", number_region, extract_phone, NUMBER_BOX_OFFSETS)
     if not phone_number:
         print("[WARN] Could not copy a valid phone number. Leaving this ticket for a human.")
         return False
     print(f"[TICKET] Copied phone number: '{phone_number}'")
 
+    try:
+        return verify_with_itunes(ticket, phone_number)
+    finally:
+        ticket.back_to_bottom()
+
+
+def verify_with_itunes(ticket, phone_number):
+    """iTunes part of a claimed ticket: phone number, the user's code, then the Discord outcome."""
     # Switch to iTunes
     switch_to_itunes()
 
@@ -861,11 +999,8 @@ def process_ticket():
         run_itunes_reset_cycle(return_to_discord=True)
 
         # In Discord: click Reject directly if visible; if user submitted code, click Action -> Reject
-        reject_loc = wait_for_element("discord_reject_btn.png", timeout=3, confidence=0.82, pick_bottom=True)
-        if reject_loc:
-            click_and_wait_for_update(reject_loc.x, reject_loc.y, "Reject")
-        else:
-            select_discord_action_menu_item("discord_menu_reject.png")
+        if not ticket.click_button("discord_reject_btn.png", "Reject"):
+            ticket.choose_action("discord_menu_reject.png")
         return False
 
     # CHECK 2: Did iTunes reach the "Enter the verification code" screen?
@@ -877,12 +1012,17 @@ def process_ticket():
     # Up to 2 attempts to receive and verify the 4-digit SMS code
     previous_code = None
     for attempt in (1, 2):
-        code = wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=previous_code)
+        code = wait_for_user_code(ticket, timeout=CODE_WAIT_TIMEOUT, previous_code=previous_code)
+
+        if code == USER_LEFT:
+            print("[LEFT] The user left. Stopping this ticket, resetting iTunes and waiting for the next one.")
+            run_itunes_reset_cycle(return_to_discord=True)
+            return False
 
         # If user did not submit a code within 2 minutes:
         if not code:
             print(f"[TIMEOUT] No code submitted on attempt {attempt}. Failing verification...")
-            select_discord_action_menu_item("discord_menu_failed_verification.png")
+            ticket.choose_action("discord_menu_failed_verification.png")
             run_itunes_reset_cycle(return_to_discord=True)
             return False
 
@@ -918,26 +1058,19 @@ def process_ticket():
                 # After a code was submitted the ticket only offers Resend Code inside the Action menu
                 switch_to_discord()
                 print("[RETRY] Clicking Action -> Resend Code in Discord...")
-                if select_discord_action_menu_item("discord_menu_resend_code.png"):
+                if ticket.choose_action("discord_menu_resend_code.png"):
                     print("[RETRY] Resend Code clicked! Waiting 2 more minutes for the 2nd code...")
+                elif ticket.click_button("discord_resend_available.png", "Resend Code", confidence=0.85):
+                    print("[RETRY] Clicked the Resend Code button! Waiting 2 more minutes for the 2nd code...")
                 else:
-                    resend_loc = wait_for_element("discord_resend_available.png", timeout=3, confidence=0.85, pick_bottom=True)
-                    if resend_loc:
-                        click_and_wait_for_update(resend_loc.x, resend_loc.y, "Resend Code")
-                        print("[RETRY] Clicked the Resend Code button! Waiting 2 more minutes for the 2nd code...")
-                    else:
-                        print("[WARN] Could not click Resend Code; still waiting for a new code")
+                    print("[WARN] Could not click Resend Code; still waiting for a new code")
                 previous_code = code
                 continue
             else:
                 # 2nd wrong code: click Failed Verification in Discord and reset iTunes
                 print("[FAILED] 2nd wrong code! Clicking Failed Verification and resetting iTunes...")
-                switch_to_discord()
-                failed_loc = wait_for_element("discord_failed_verification_btn.png", timeout=3, confidence=0.82, pick_bottom=True)
-                if failed_loc:
-                    click_and_wait_for_update(failed_loc.x, failed_loc.y, "Failed Verification")
-                else:
-                    select_discord_action_menu_item("discord_menu_failed_verification.png")
+                if not ticket.click_button("discord_failed_verification_btn.png", "Failed Verification"):
+                    ticket.choose_action("discord_menu_failed_verification.png")
                 run_itunes_reset_cycle(return_to_discord=True)
                 return False
 
@@ -945,19 +1078,14 @@ def process_ticket():
         if outcome == "itunes_billing_issue_banner.png":
             print("[BILLING ISSUE] Billing issue banner detected in iTunes!")
             run_itunes_reset_cycle(return_to_discord=True)
-            select_discord_action_menu_item("discord_menu_billing_issue.png")
+            ticket.choose_action("discord_menu_billing_issue.png")
             return False
 
         # OUTCOME C: Success! Manage Payments shows Mobile Phone added
         if outcome == "itunes_mobile_phone_verified.png":
             print("[SUCCESS] Mobile Phone added in Manage Payments! Marking the ticket as verified...")
-            switch_to_discord()
-
             # Click Mark as Verified button directly (Action menu only used for ✅⚠️ case)
-            verified_loc = wait_for_element("discord_mark_verified_btn.png", timeout=8, confidence=0.82, pick_bottom=True)
-            if verified_loc:
-                click_and_wait_for_update(verified_loc.x, verified_loc.y, "Mark as Verified")
-            else:
+            if not ticket.click_button("discord_mark_verified_btn.png", "Mark as Verified", timeout=8):
                 print("[WARN] Mark as Verified button not found")
             return True
 
@@ -980,7 +1108,11 @@ def ask_resolution():
         if arg in PROFILES:
             return arg
     detected = "%dx%d" % screen_size()
-    default = detected if detected in PROFILES else BASE_PROFILE
+    if detected not in PROFILES:
+        # Any other screen works the same way as 1920x1080: borrowed images, only clicks what it sees
+        PROFILES[detected] = {"taskbar_discord_region": None, "taskbar_itunes_region": None, "coords": {}}
+        names.append(detected)
+    default = detected
     print("Screen resolution:")
     for i, name in enumerate(names, 1):
         print(f"  {i}) {name}" + ("   <- this screen" if name == detected else ""))
@@ -1006,6 +1138,18 @@ def describe_profile():
     detected = "%dx%d" % screen_size()
     if detected != profile_name:
         print(f"[WARN] This screen is {detected}, not {profile_name}; images and click spots may not line up.")
+    scale = display_scale()
+    if abs(scale - 1.0) > 0.01:
+        print(f"[WARN] Windows display scaling is {scale:.0%}. The images are made at 100%, so buttons will not "
+              "be found: set Settings > System > Display > Scale to 100%.")
+
+
+def display_scale():
+    """Windows display scaling (1.0 = 100%)."""
+    try:
+        return ctypes.windll.user32.GetDpiForSystem() / 96.0
+    except Exception:
+        return 1.0
 
 
 def ask_verification_limit():

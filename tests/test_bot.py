@@ -274,7 +274,7 @@ class TestCopyTicketValue(unittest.TestCase):
         code = bot.copy_ticket_value("discord_code_label.png", (0, 0, 400, 200), bot.extract_code,
                                      bot.CODE_BOX_OFFSETS)
         self.assertEqual(code, "1122")
-        self.assertEqual(self.clicks, [2])
+        self.assertEqual(self.clicks, [2, 1])  # double-click, then a click to clear the selection
         self.assertEqual(self.drags, [])
         self.assertLessEqual(abs(self.moves[0][0] - 186), 1)
 
@@ -283,7 +283,7 @@ class TestCopyTicketValue(unittest.TestCase):
         number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
                                        bot.NUMBER_BOX_OFFSETS)
         self.assertEqual(number, "06 12 36 54 85")
-        self.assertEqual(self.clicks, [2])
+        self.assertEqual(self.clicks, [2, 1])  # double-click, then a click to clear the selection
         self.assertEqual(self.drags, [])
 
     def test_bad_copy_retries_with_another_double_click(self):
@@ -291,7 +291,7 @@ class TestCopyTicketValue(unittest.TestCase):
         number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
                                        bot.NUMBER_BOX_OFFSETS)
         self.assertEqual(number, "06 12 36 54 85")
-        self.assertEqual(self.clicks, [2, 2])
+        self.assertEqual(self.clicks, [2, 1, 2, 1])
         self.assertEqual(self.drags, [])
 
     def test_code_is_not_clicked_while_the_timer_shows(self):
@@ -503,6 +503,9 @@ class TestClipboard(unittest.TestCase):
             self.assertEqual(bot.get_clipboard_text(), "")  # the tkinter stub's clipboard is empty
 
 
+FAKE_TICKET = types.SimpleNamespace(region=lambda: (0, 0, 400, 300))
+
+
 class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
     def test_waits_until_the_code_changes(self):
         from unittest import mock
@@ -514,7 +517,7 @@ class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
              mock.patch.object(bot, "copy_ticket_value", lambda *a, **k: codes.pop(0)), \
              mock.patch.object(bot.time, "sleep", lambda s: None), \
              mock.patch("builtins.print"):
-            self.assertEqual(bot.wait_for_user_code(timeout=5, previous_code="1122"), "4567")
+            self.assertEqual(bot.wait_for_user_code(FAKE_TICKET, timeout=5, previous_code="1122"), "4567")
 
     def test_waits_while_the_timer_shows_then_takes_the_code(self):
         from unittest import mock
@@ -526,7 +529,7 @@ class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
              mock.patch.object(bot, "copy_ticket_value", lambda *a, **k: codes.pop(0)), \
              mock.patch.object(bot.time, "sleep", lambda s: None), \
              mock.patch("builtins.print"):
-            self.assertEqual(bot.wait_for_user_code(timeout=5, previous_code="1122"), "1246")
+            self.assertEqual(bot.wait_for_user_code(FAKE_TICKET, timeout=5, previous_code="1122"), "1246")
 
 
 @unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
@@ -708,6 +711,144 @@ class TestBatchScripts(unittest.TestCase):
         for name in ("find_python.bat", "install_requirements.bat", "start_bot.bat", "auto-pull.bat"):
             data = self._read(name)
             self.assertEqual(data.count(b"\n"), data.count(b"\r\n"), f"{name} has Unix line endings")
+
+
+@unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
+class TestTicketTracking(unittest.TestCase):
+    """The bot follows its own ticket by its number box, even after newer tickets push it up."""
+
+    def _shot(self, screen):
+        return lambda region=None: screen if region is None else screen.crop(
+            (region[0], region[1], region[0] + region[2], region[1] + region[3]))
+
+    def _number_box(self, screen, left, y, digits_seed):
+        # grey value box with a digit-like pattern that differs per phone number
+        import random as rnd
+        rng = rnd.Random(digits_seed)
+        for x in range(left, left + 73):
+            for yy in range(y - 6, y + 7):
+                screen.putpixel((x, yy), bot.VALUE_BOX_RGB)
+        for x in range(left + 3, left + 70):
+            for yy in range(y - 3, y + 4):
+                if rng.random() < 0.35:
+                    screen.putpixel((x, yy), (220, 220, 225))
+
+    def _screen(self, boxes):
+        from PIL import Image
+        screen = Image.new("RGB", (1440, 900), (36, 36, 41))
+        for left, y, seed in boxes:
+            self._number_box(screen, left, y, seed)
+        return screen
+
+    def test_finds_its_own_ticket_after_a_new_one_pushes_it_up(self):
+        from unittest import mock
+        before = self._screen([(150, 700, "06 41 17 99 27")])
+        with mock.patch.object(bot.pyautogui, "screenshot", self._shot(before), create=True):
+            ticket = bot.Ticket(150, 222, 700)
+        # a newer ticket (different number) arrives below and pushes ours up by 260px
+        after = self._screen([(150, 440, "06 41 17 99 27"), (150, 700, "07 12 34 56 78")])
+        with mock.patch.object(bot.pyautogui, "screenshot", self._shot(after), create=True), \
+             mock.patch.object(bot, "get_active_window_title", lambda: "Discord"):
+            self.assertEqual(ticket.find(), bot.Point(186, 440))
+            region = ticket.region()
+        self.assertTrue(region[1] <= 440 + 43 <= region[1] + region[3], "Code line must be inside the area")
+        self.assertLess(region[1] + region[3], 700, "the newer ticket's lines must stay outside the area")
+
+
+class TestTicketScrolling(unittest.TestCase):
+    def test_scrolls_up_until_found_then_back_down(self):
+        from unittest import mock
+        scrolls = []
+        found = [None, None, bot.Point(186, 120)]
+        ticket = bot.Ticket.__new__(bot.Ticket)
+        ticket.fingerprint, ticket.center, ticket.scrolled = object(), bot.Point(186, 500), 0
+        with mock.patch.object(bot, "locate_template", lambda *a, **k: found.pop(0)), \
+             mock.patch.object(bot, "get_active_window_title", lambda: "Discord"), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "human_move", lambda *a, **k: None), \
+             mock.patch.object(bot, "human_pause", lambda *a, **k: None), \
+             mock.patch.object(bot.pyautogui, "scroll", lambda n: scrolls.append(n)), \
+             mock.patch.object(bot.time, "sleep", lambda s: None), \
+             mock.patch("builtins.print"):
+            self.assertEqual(ticket.find(), bot.Point(186, 120))
+            self.assertEqual(ticket.scrolled, 6)
+            self.assertEqual(scrolls, [120] * 6)
+            ticket.back_to_bottom()
+        self.assertEqual(scrolls[6:], [-120] * (6 + 15))
+        self.assertEqual(ticket.scrolled, 0)
+
+
+class TestUserLeft(unittest.TestCase):
+    def test_code_wait_stops_when_the_user_left(self):
+        from unittest import mock
+        with mock.patch.object(bot, "locate_element",
+                               lambda name, **k: Point(120, 160) if name == "discord_code_left.png" else None), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "copy_ticket_value", lambda *a, **k: self.fail("must not copy")), \
+             mock.patch("builtins.print"):
+            self.assertEqual(bot.wait_for_user_code(FAKE_TICKET, timeout=5), bot.USER_LEFT)
+
+    def test_left_image_is_only_looked_for_in_this_tickets_area(self):
+        from unittest import mock
+        regions = []
+
+        def fake_locate(name, **kwargs):
+            if name == "discord_code_left.png":
+                regions.append(kwargs.get("region"))
+            return None
+
+        codes = ["1246"]
+        with mock.patch.object(bot, "locate_element", fake_locate), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot.time, "sleep", lambda s: None), \
+             mock.patch("builtins.print"):
+            bot.wait_for_user_code(FAKE_TICKET, timeout=0.05)
+        self.assertTrue(regions and all(r == (0, 0, 400, 300) for r in regions))
+        del codes
+
+
+class TestActionMenuInTicketArea(unittest.TestCase):
+    def test_action_is_searched_in_the_given_area_not_the_newest_ticket(self):
+        from unittest import mock
+        calls = {}
+
+        def fake_wait(image_name, **kwargs):
+            calls[image_name] = kwargs
+            return Point(100, 200)
+
+        with mock.patch.object(bot, "wait_for_element", fake_wait), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "human_click", lambda *a, **k: None), \
+             mock.patch.object(bot, "click_and_wait_for_update", lambda *a, **k: None):
+            bot.select_discord_action_menu_item("discord_menu_resend_code.png", region=(10, 20, 300, 200))
+        self.assertEqual(calls["discord_action_dropdown.png"].get("region"), (10, 20, 300, 200))
+        self.assertFalse(calls["discord_action_dropdown.png"].get("pick_bottom"))
+
+
+class TestAnyResolution(unittest.TestCase):
+    def tearDown(self):
+        bot.PROFILES.pop("2560x1440", None)
+        bot.select_profile(bot.BASE_PROFILE)
+
+    def test_unknown_screen_size_gets_its_own_profile(self):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["bot.py"]), \
+             mock.patch.object(bot.pyautogui, "size", lambda: (2560, 1440), create=True), \
+             mock.patch("builtins.input", return_value=""), \
+             mock.patch("builtins.print"):
+            self.assertEqual(bot.ask_resolution(), "2560x1440")
+        self.assertEqual(bot.PROFILES["2560x1440"]["coords"], {})
+        bot.select_profile("2560x1440")
+        self.assertTrue(bot.img_path("discord_claim_btn.png").endswith(os.path.join("1440x900", "discord_claim_btn.png")))
+
+    def test_warns_when_display_scaling_is_not_100(self):
+        from unittest import mock
+        printed = []
+        with mock.patch.object(bot, "display_scale", lambda: 1.25), \
+             mock.patch.object(bot.pyautogui, "size", lambda: (1440, 900), create=True), \
+             mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            bot.describe_profile()
+        self.assertTrue(any("125%" in line for line in printed), printed)
 
 
 if __name__ == "__main__":
