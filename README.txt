@@ -31,6 +31,13 @@ what it found, e.g. "[SCALE] Discord is drawn at 100% size". 100% scaling is
 still the most reliable, because text drawn at another size never matches a
 resized image perfectly. Discord must use its dark theme.
 
+You can change the resolution, the scaling or Discord's zoom while the bot
+runs: it notices ("[SCREEN] Changed from ..." or "[SCALE] ... measuring it
+again") and adjusts on the fly. Best between tickets: a claimed ticket is
+recognised by a snapshot of its number, which no longer matches after a
+scaling or zoom change (a resolution change alone is fine), so tickets already
+claimed at that moment are left for a human.
+
 BACKUP CLICK SPOTS:
 If a button's image is missed, the bot clicks where it last saw that button
 on this screen (it remembers them in learned_spots.json; delete that file if
@@ -44,6 +51,18 @@ the bottom-right corner by its X, one after another while new ones keep
 coming, waiting each time until they stop sliding. It looks again right
 before the click, so one that pops up while the mouse is moving is closed
 too, instead of being clicked (that would open Discord).
+
+SEVERAL TICKETS AT ONCE:
+New tickets are claimed right away, even while the bot is busy with another
+one: while it waits for a code in Discord it claims every new ticket it sees,
+and while it is in iTunes a new-ticket notification is clicked, the ticket
+claimed, and the bot goes back to iTunes and carries on where it was. Claimed
+tickets are then handled one after another, oldest first (never more than
+the verification goal needs).
+While another claimed ticket is waiting, the current user gets one try: no
+code within 1 minute, or a wrong code, and the ticket is failed right away so
+the next one can start. With nobody else waiting it is as before: 2 minutes,
+and after a wrong code a Resend Code and a second try.
 
 DURING A TICKET:
 The bot remembers its ticket by the phone-number box, so new tickets arriving

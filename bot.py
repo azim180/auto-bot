@@ -8,20 +8,44 @@ import random
 import ctypes
 import collections
 import tkinter as tk
-import cv2
-import numpy as np
-import pyautogui
+
+
+def _use_real_pixels():
+    """
+    Screenshots and clicks in real screen pixels at any display scaling, also after the scaling
+    is changed while the bot runs (per-monitor DPI awareness). It must happen before pyautogui
+    is imported, which would otherwise lock in the older mode that Windows rescales.
+    """
+    try:
+        user32 = ctypes.windll.user32
+    except AttributeError:
+        return  # not Windows
+    try:
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):  # per-monitor v2
+            return
+    except Exception:
+        pass
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:  # per-monitor
+            return
+    except Exception:
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_use_real_pixels()
+
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+import pyautogui  # noqa: E402
 
 try:
     import pyperclip  # installed with pyautogui; talks to the Windows clipboard directly
 except ImportError:
     pyperclip = None
-
-try:
-    # Real pixels at any Windows display scaling (pyautogui does this too; it must happen first)
-    ctypes.windll.user32.SetProcessDPIAware()
-except Exception:
-    pass
 
 Point = collections.namedtuple("Point", "x y")
 
@@ -41,6 +65,9 @@ ADD_PAYMENT_CONFIDENCE = 0.88
 KEEP_ALIVE_INTERVAL = 600
 # 2-minute timer (120 seconds) waiting for the user's verification code
 CODE_WAIT_TIMEOUT = 120
+# While another claimed ticket is waiting its turn, the current user gets one try: no code within
+# this long (1 minute), or a wrong code, and the ticket is failed so the next one can start
+BUSY_CODE_TIMEOUT = 60
 
 # Fallback "the embed finished updating" rule: unchanged for this long
 EMBED_SETTLE_SECONDS = 0.35
@@ -99,6 +126,8 @@ SCALED_CONFIDENCE_DROP = 0.03
 SCALE_ADOPT_CONFIDENCE = 0.85
 CALIBRATION_RETRY_SECONDS = 30
 MAX_CALIBRATION_SEARCHES = 3  # then it stays at the display scaling
+# An app whose images have not matched clearly for this long is checked again (zoom changed?)
+RECHECK_SECONDS = 20
 
 # Track the last time the iTunes Account -> Manage Payments -> Mobile Carrier cycle ran
 last_itunes_cycle_time = time.time()
@@ -118,9 +147,26 @@ def screen_size():
         return (1440, 900)
 
 
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 def display_scale():
-    """Windows display scaling (1.0 = 100%)."""
+    """The main screen's Windows display scaling right now (1.0 = 100%)."""
     try:
+        user32, shcore = ctypes.windll.user32, ctypes.windll.shcore
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.MonitorFromPoint.argtypes = [_POINT, ctypes.c_uint]
+        shcore.GetDpiForMonitor.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+        monitor = user32.MonitorFromPoint(_POINT(0, 0), 1)  # the primary monitor
+        dpi_x, dpi_y = ctypes.c_uint(), ctypes.c_uint()
+        if shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y)) == 0 and dpi_x.value:
+            return dpi_x.value / 96.0
+    except Exception:
+        pass
+    try:
+        # Windows before 8.1: the scaling the user signed in with
         return ctypes.windll.user32.GetDpiForSystem() / 96.0
     except Exception:
         return 1.0
@@ -275,6 +321,8 @@ ui_scale = dict.fromkeys(UI_GROUPS, 1.0)  # how big each app is drawn, relative 
 scale_confirmed = set()                    # apps whose size has been measured
 _last_calibration = {}
 _calibration_searches = collections.Counter()
+_last_seen_ok = {}                         # when each app's images last matched clearly
+_screen_seen = None                        # screen_key() the sizes were measured on
 _templates = {}
 _scaled_templates = {}
 
@@ -300,7 +348,26 @@ def reset_ui_scale():
     scale_confirmed.clear()
     _last_calibration.clear()
     _calibration_searches.clear()
+    _last_seen_ok.clear()
     _scaled_templates.clear()
+
+
+def watch_screen():
+    """
+    Notices when the resolution or display scaling was changed while the bot runs: every app is
+    then measured again, and the backup click spots of the new screen are used. True if it changed.
+    """
+    global _screen_seen, _spots
+    key = screen_key()
+    if _screen_seen is None:
+        _screen_seen = key
+    if key == _screen_seen:
+        return False
+    print(f"[SCREEN] Changed from {_screen_seen} to {key} - measuring every app again...")
+    _screen_seen = key
+    _spots = None
+    reset_ui_scale()
+    return True
 
 
 def _load_template(image_name):
@@ -450,9 +517,39 @@ def calibrate_scale(group, screen=None, search=True):
 
 def _note_match(image_name, score, scale):
     """A clear match at an app's current size proves that size is right: no need to measure it."""
+    if score < 0.9:
+        return
     group = group_of(image_name)
-    if group not in scale_confirmed and score >= 0.9:
+    _last_seen_ok[group] = time.time()
+    if group not in scale_confirmed:
         _adopt_scale(group, scale)
+
+
+def recheck_scale(group, screen=None):
+    """
+    Call while `group`'s app is in front. Measures it if that was not done yet; and when its
+    images have not matched clearly for RECHECK_SECONDS (Discord's zoom may have been changed),
+    checks its anchor images at the size it was measured at, and measures it again if they no
+    longer match there. True while the size is known.
+    """
+    if group not in scale_confirmed:
+        return calibrate_scale(group, screen)
+    now = time.time()
+    if now - _last_seen_ok.get(group, now) < RECHECK_SECONDS:
+        return True
+    _last_seen_ok[group] = now  # at most one check per RECHECK_SECONDS
+    screen = screen if screen is not None else grab_screen()
+    if screen is None:
+        return True
+    scale = ui_scale[group]
+    enough = _threshold(CONFIDENCE, scale)
+    if _anchor_score(group, scale, _bgr(screen), enough=enough) >= enough:
+        return True
+    print(f"[SCALE] {UI_GROUPS[group]} no longer looks {scale:.0%} big - measuring it again...")
+    scale_confirmed.discard(group)
+    _calibration_searches[group] = 0
+    _last_calibration.pop(group, None)
+    return calibrate_scale(group, screen)
 
 
 def _adopt_scale(group, scale):
@@ -460,6 +557,7 @@ def _adopt_scale(group, scale):
         _scaled_templates.clear()
     ui_scale[group] = scale
     scale_confirmed.add(group)
+    _last_seen_ok[group] = time.time()
     print(f"[SCALE] {UI_GROUPS[group]} is drawn at {scale:.0%} size; images are matched at that size.")
     return True
 
@@ -539,14 +637,23 @@ def wait_for_element(image_name, timeout=10, confidence=CONFIDENCE, pick_bottom=
     return None
 
 
-def wait_for_any(candidates, timeout=15):
-    """Waits for the first of several (image, confidence) pairs to appear; returns its image name."""
-    start = time.time()
-    while time.time() - start < timeout:
+def wait_for_any(candidates, timeout=15, watch_tickets=False):
+    """
+    Waits for the first of several (image, confidence) pairs to appear; returns its image name.
+    With `watch_tickets` (waiting in iTunes during a ticket), a new-ticket notification is claimed
+    first and the wait carries on, with the time that took added to it.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         screen = grab_screen()
         for image_name, confidence in candidates:
             if locate_element(image_name, confidence=confidence, screen=screen):
                 return image_name
+        if watch_tickets:
+            began = time.time()
+            if claim_from_notification(screen):
+                deadline += time.time() - began
+                continue
         time.sleep(0.1)
     return None
 
@@ -730,7 +837,7 @@ def wait_for_window(name, timeout=4):
 
 def _click_taskbar_icon(app, image_name, spot_name):
     """Clicks an app's taskbar icon. False if it cannot be found."""
-    calibrate_scale("windows")
+    recheck_scale("windows")
     loc = locate_element(image_name, confidence=0.80, region=taskbar_region(app))
     if loc:
         remember_spot(spot_name, loc)
@@ -743,9 +850,10 @@ def _click_taskbar_icon(app, image_name, spot_name):
 
 def switch_to_discord():
     """Brings the Right Discord instance to the foreground without minimizing it."""
+    watch_screen()
     title = get_active_window_title()
     if "Discord" in title or locate_element("discord_chat_input.png", confidence=0.80):
-        calibrate_scale("discord")
+        recheck_scale("discord")
         return
     print("[SWITCH] Clicking Right Discord icon on taskbar...")
     if not _click_taskbar_icon("discord", "taskbar_discord_right.png", "taskbar_discord_right"):
@@ -754,14 +862,15 @@ def switch_to_discord():
     if not wait_for_window("Discord"):
         print("[WARN] Discord window did not come to the front")
     human_pause(0.12, 0.25)  # let it repaint
-    calibrate_scale("discord")
+    recheck_scale("discord")
 
 
 def switch_to_itunes():
     """Brings iTunes to the foreground from minimized/background state."""
+    watch_screen()
     title = get_active_window_title()
     if "iTunes" in title or locate_element("itunes_menu_account.png", confidence=0.82):
-        calibrate_scale("itunes")
+        recheck_scale("itunes")
         return
     print("[SWITCH] Clicking iTunes icon on taskbar...")
     if not _click_taskbar_icon("itunes", "taskbar_itunes.png", "taskbar_itunes"):
@@ -770,7 +879,7 @@ def switch_to_itunes():
     if not wait_for_window("iTunes"):
         print("[WARN] iTunes window did not come to the front")
     human_pause(0.15, 0.3)  # let it repaint
-    calibrate_scale("itunes")
+    recheck_scale("itunes")
 
 
 def notification_area():
@@ -782,21 +891,51 @@ def notification_area():
     return (screen_w // 2, screen_h // 2, screen_w - screen_w // 2, screen_h - screen_h // 2)
 
 
-def open_ticket_from_notification(screen=None):
-    """Clicks a new-ticket Windows notification to jump to its channel. True if a Claim button shows up."""
+def find_new_ticket_notification(screen=None):
+    """Where a new-ticket Windows notification is showing, or None."""
     toast_area = notification_area()
     for image_name in ("notif_new_ticket_blue.png", "notif_new_ticket_purple.png"):
         loc = locate_element(image_name, confidence=0.80, region=toast_area, screen=screen)
-        if not loc:
-            continue
-        print("[NOTIFY] New ticket notification - opening its channel...")
-        human_click(loc.x, loc.y)
-        wait_for_window("Discord")
-        if wait_for_element("discord_claim_btn.png", timeout=6, confidence=CONFIDENCE, pick_bottom=True):
-            return True
-        print("[NOTIFY] Channel opened but no Claim button showed up")
+        if loc:
+            return loc
+    return None
+
+
+def open_ticket_from_notification(screen=None):
+    """Clicks a new-ticket Windows notification to jump to its channel. True if a Claim button shows up."""
+    loc = find_new_ticket_notification(screen)
+    if not loc:
         return False
+    print("[NOTIFY] New ticket notification - opening its channel...")
+    human_click(loc.x, loc.y)
+    wait_for_window("Discord")
+    if wait_for_element("discord_claim_btn.png", timeout=6, confidence=CONFIDENCE, pick_bottom=True):
+        return True
+    print("[NOTIFY] Channel opened but no Claim button showed up")
     return False
+
+
+def claim_from_notification(screen=None):
+    """
+    While a ticket is being worked on in iTunes: if a new-ticket notification shows up, click it,
+    claim the new ticket in Discord, and come back to iTunes. True if it did; the caller then
+    carries on where it left off.
+    """
+    if work.current is None or not work.can_claim():
+        return False
+    loc = find_new_ticket_notification(screen)
+    if not loc:
+        return False
+    print("[NOTIFY] New ticket while busy in iTunes - claiming it first...")
+    human_click(loc.x, loc.y)
+    wait_for_window("Discord")
+    if wait_for_element("discord_claim_btn.png", timeout=6, confidence=CONFIDENCE, pick_bottom=True):
+        claim_new_tickets()
+    else:
+        print("[NOTIFY] Channel opened but no Claim button showed up")
+    print("[NOTIFY] Back to iTunes to carry on with the current ticket...")
+    switch_to_itunes()
+    return True
 
 
 def find_notification(screen=None):
@@ -843,6 +982,7 @@ def click_itunes_submit(spot_name):
     """
     misses = 0
     for _ in range(8):
+        claim_from_notification()  # a new ticket's notification is clicked, not closed
         close_notifications()
         loc = wait_for_element("itunes_submit_btn.png", timeout=1.5, confidence=0.82)
         if loc:
@@ -908,7 +1048,8 @@ def run_itunes_reset_cycle(return_to_discord=True):
             click_element("itunes_manage_payments_link.png", spot_name="itunes_manage_payments")
 
         # Manage Payments shows either the existing list ("Add Payment") or the payment-type picker
-        page = wait_for_any([("itunes_add_payment_btn.png", ADD_PAYMENT_CONFIDENCE), ("itunes_mobile_carrier_icon.png", CONFIDENCE)], timeout=10)
+        page = wait_for_any([("itunes_add_payment_btn.png", ADD_PAYMENT_CONFIDENCE), ("itunes_mobile_carrier_icon.png", CONFIDENCE)],
+                            timeout=10, watch_tickets=True)
         if page == "itunes_add_payment_btn.png":
             print("[ITUNES CYCLE] Clicking Add Payment...")
             click_element("itunes_add_payment_btn.png", confidence=ADD_PAYMENT_CONFIDENCE)
@@ -1019,14 +1160,22 @@ def wait_for_user_code(ticket, timeout=CODE_WAIT_TIMEOUT, previous_code=None):
     """
     Waits up to `timeout` seconds (2 minutes) for the user to submit their verification code on
     `ticket`: its "Mark as Verified" button appears and the Code shows 4 digits in its box.
+    While another claimed ticket is waiting, gives up after BUSY_CODE_TIMEOUT (1 minute) instead.
+    New tickets that show up meanwhile are claimed right away.
     `previous_code` (the rejected one) is ignored while it is still showing on the ticket.
     Returns the code, None on timeout, or USER_LEFT when the Code shows "❌Left".
     """
-    print(f"[WAIT] Waiting up to {timeout}s for user to submit verification code...")
+    busy = " (1 minute while another ticket is waiting)" if work.waiting else ""
+    print(f"[WAIT] Waiting up to {timeout}s{busy} for user to submit verification code...")
     start = time.time()
+    last_sweep = 0.0
     told_old_code = told_no_box = False
 
     while time.time() - start < timeout:
+        if work.waiting and time.time() - start >= BUSY_CODE_TIMEOUT:
+            print(f"[BUSY] No code within {BUSY_CODE_TIMEOUT}s and another ticket is waiting - failing this one.")
+            return None
+        watch_screen()
         screen = grab_screen()
         # 1. Check if Windows notification popped up showing "Submitted code:"
         if locate_element("notif_code_submitted.png", confidence=0.80, screen=screen):
@@ -1064,9 +1213,17 @@ def wait_for_user_code(ticket, timeout=CODE_WAIT_TIMEOUT, previous_code=None):
                 print(f"[CODE COPIED] Extracted verification code: {code}")
                 return code
 
+        # New tickets show up at the bottom of the chat: claim them right away (less often while
+        # the chat is scrolled up to this ticket, since going down and back up takes a moment)
+        if work.can_claim() and time.time() - last_sweep >= (10 if ticket.scrolled else 3):
+            last_sweep = time.time()
+            ticket.back_to_bottom()
+            claim_new_tickets()
+            continue
+
         time.sleep(0.2)
 
-    print("[TIMEOUT] 2 minutes elapsed without a valid code submission.")
+    print(f"[TIMEOUT] {timeout}s elapsed without a valid code submission.")
     return None
 
 
@@ -1173,19 +1330,39 @@ class Ticket:
 # ==============================================================================
 # MAIN TICKET WORKFLOW
 # ==============================================================================
-def process_ticket():
-    """Handles a single Discord verification ticket from Claim to completion. True when verified."""
-    switch_to_discord()
+class Work:
+    """The ticket being worked on, the claimed ones waiting their turn, and the verification goal."""
 
+    def __init__(self, limit=None):
+        self.limit = limit          # stop after this many verifications (None = no limit)
+        self.verified = 0
+        self.current = None         # the Ticket being worked on
+        self.waiting = collections.deque()  # claimed Tickets, oldest first
+
+    def can_claim(self):
+        """False once the tickets in hand are enough to reach the verification goal."""
+        if self.limit is None:
+            return True
+        return self.verified + len(self.waiting) + (self.current is not None) < self.limit
+
+
+work = Work()
+
+
+def claim_ticket():
+    """
+    Claims the newest unclaimed ticket on screen. Returns it as a Ticket to work on, or None if
+    there is nothing (more) to do for it: not claimed, ✅⚠️ marked verified, user gone, no number.
+    """
     claim_loc = locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True)
     if not claim_loc:
-        return False
+        return None
 
     # A freshly posted ticket may still be drawing; wait until it is still, then find Claim again
     wait_for_screen_settle(screen_area_around(claim_loc.x, claim_loc.y), settle=0.2, timeout=2, interval=0.05)
     claim_loc = locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True)
     if not claim_loc:
-        return False
+        return None
 
     # Check if the newest ticket has the special returning-user warning: Server -> ✅ ⚠️
     embed_region = (max(0, int(claim_loc.x) - px(120)), max(0, int(claim_loc.y) - px(160)), px(350), px(160))
@@ -1197,7 +1374,7 @@ def process_ticket():
     anchor = wait_for_claim_to_register(claim_loc)
     if anchor is None:
         print("[WARN] Claim did not go through (Claim button still there). Skipping this ticket.")
-        return False
+        return None
     print("[TICKET] Claimed - ticket updated.")
 
     # SPECIAL CASE: Server -> ✅ ⚠️ (Claim -> Action -> Mark as Verified immediately)
@@ -1205,7 +1382,7 @@ def process_ticket():
         print("[SPECIAL CASE] Returning user (✅ ⚠️) detected! Marking as Verified via Action menu...")
         select_discord_action_menu_item("discord_menu_mark_verified.png",
                                         region=screen_area_around(anchor.x, anchor.y, left=250, up=60, right=300, down=80))
-        return False
+        return None
 
     # Remember this ticket by its number box (before the copy selects it), so it can be found again
     number_region = screen_area_around(anchor.x, anchor.y, left=250, up=170, right=250, down=0)
@@ -1213,24 +1390,56 @@ def process_ticket():
                                     region=number_region)
     if not number_label:
         print("[WARN] Could not find the ticket's Number. Leaving this ticket for a human.")
-        return False
+        return None
     box = find_value_box(number_label) or (number_label.x + px(NUMBER_BOX_OFFSETS[0]), number_label.x + px(NUMBER_BOX_OFFSETS[1]))
     ticket = Ticket(box[0], box[1], number_label.y)
 
     if ticket.has_user_left():
-        print("[LEFT] The user already left. Skipping this ticket and waiting for the next one.")
-        return False
+        print("[LEFT] The user already left. Skipping this ticket.")
+        return None
+    return ticket
 
-    # Copy the phone number as-is (leading 0 and spaces are fine, iTunes strips spaces automatically)
-    phone_number = copy_ticket_value("discord_number_label.png", number_region, extract_phone, NUMBER_BOX_OFFSETS)
-    if not phone_number:
-        print("[WARN] Could not copy a valid phone number. Leaving this ticket for a human.")
-        return False
-    print(f"[TICKET] Copied phone number: '{phone_number}'")
 
+def claim_new_tickets():
+    """
+    Claims every unclaimed ticket showing in Discord right away (newest first), and puts them in
+    line to be worked on, oldest first. Returns how many were put in line.
+    """
+    switch_to_discord()
+    first = len(work.waiting)
+    for _ in range(6):  # a Claim that does not go through stays on screen: don't keep trying it
+        if not work.can_claim() or not locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True):
+            break
+        ticket = claim_ticket()
+        if ticket:
+            work.waiting.insert(first, ticket)  # older ones (claimed later) go in front
+    added = len(work.waiting) - first
+    if added and work.current is not None:
+        print(f"[QUEUE] {len(work.waiting)} claimed ticket(s) waiting for their turn.")
+    return added
+
+
+def work_on_ticket(ticket):
+    """Copies a claimed ticket's phone number and verifies it with iTunes. True when verified."""
+    work.current = ticket
     try:
+        region = ticket.region()
+        if region is None:
+            print("[WARN] Could not find the ticket again. Leaving it for a human.")
+            return False
+        if locate_element("discord_code_left.png", confidence=0.85, region=region):
+            print("[LEFT] The user left before their turn. Skipping this ticket.")
+            return False
+
+        # Copy the phone number as-is (leading 0 and spaces are fine, iTunes strips spaces automatically)
+        phone_number = copy_ticket_value("discord_number_label.png", region, extract_phone, NUMBER_BOX_OFFSETS)
+        if not phone_number:
+            print("[WARN] Could not copy a valid phone number. Leaving this ticket for a human.")
+            return False
+        print(f"[TICKET] Copied phone number: '{phone_number}'")
         return verify_with_itunes(ticket, phone_number)
     finally:
+        work.current = None
         ticket.back_to_bottom()
 
 
@@ -1238,6 +1447,7 @@ def verify_with_itunes(ticket, phone_number):
     """iTunes part of a claimed ticket: phone number, the user's code, then the Discord outcome."""
     # Switch to iTunes
     switch_to_itunes()
+    claim_from_notification()
 
     # Ensure iTunes is on the Add Payment -> Mobile Carrier (+33) screen
     if not wait_for_element("itunes_phone_input.png", timeout=2, confidence=0.80):
@@ -1262,7 +1472,7 @@ def verify_with_itunes(ticket, phone_number):
     result = wait_for_any([
         ("itunes_unable_to_send_code.png", 0.80),
         ("itunes_enter_code_input.png", 0.80),
-    ], timeout=15)
+    ], timeout=15, watch_tickets=True)
 
     # CHECK 1: Did "Unable to Send Code" popup appear?
     if result == "itunes_unable_to_send_code.png":
@@ -1300,6 +1510,7 @@ def verify_with_itunes(ticket, phone_number):
 
         # Switch to iTunes, enter the code, and click Submit
         switch_to_itunes()
+        claim_from_notification()
         code_box = wait_for_element("itunes_enter_code_input.png", timeout=4, confidence=0.80)
         if code_box:
             remember_spot("itunes_enter_code_box", (code_box.x + px(30, "itunes"), code_box.y))
@@ -1317,14 +1528,14 @@ def verify_with_itunes(ticket, phone_number):
             ("itunes_unable_to_verify_code.png", 0.80),
             ("itunes_billing_issue_banner.png", 0.75),
             ("itunes_mobile_phone_verified.png", 0.80),
-        ], timeout=15)
+        ], timeout=15, watch_tickets=True)
 
         # OUTCOME A: "Unable to Verify Code" popup (Wrong code entered)
         if outcome == "itunes_unable_to_verify_code.png":
             print(f"[WRONG CODE] 'Unable to Verify Code' on attempt {attempt}!")
             click_element("itunes_popup_ok_btn.png", confidence=0.80, timeout=3)
 
-            if attempt == 1:
+            if attempt == 1 and not work.waiting:
                 # 1st wrong code: click "Didn't get a verification code?" in iTunes
                 print("[RETRY] Clicking 'Didn't get a verification code?' in iTunes...")
                 click_element("itunes_didnt_get_code_link.png", confidence=0.80, spot_name="itunes_didnt_get_code", timeout=4)
@@ -1341,8 +1552,12 @@ def verify_with_itunes(ticket, phone_number):
                 previous_code = code
                 continue
             else:
-                # 2nd wrong code: click Failed Verification in Discord and reset iTunes
-                print("[FAILED] 2nd wrong code! Clicking Failed Verification and resetting iTunes...")
+                # 2nd wrong code, or a wrong code while another ticket waits (one try only then):
+                # click Failed Verification in Discord and reset iTunes
+                if attempt == 1:
+                    print("[FAILED] Wrong code and another ticket is waiting! Clicking Failed Verification...")
+                else:
+                    print("[FAILED] 2nd wrong code! Clicking Failed Verification and resetting iTunes...")
                 if not ticket.click_button("discord_failed_verification_btn.png", "Failed Verification"):
                     ticket.choose_action("discord_menu_failed_verification.png")
                 run_itunes_reset_cycle(return_to_discord=True)
@@ -1437,11 +1652,14 @@ def main():
     time.sleep(3)
     startup_check()
 
-    verified = 0
+    work.limit = limit
     last_itunes_cycle_time = time.time()
     switch_to_discord()
 
     while True:
+        # 0. Resolution or display scaling changed? Then every app is measured again
+        watch_screen()
+
         # 1. Check if 10 minutes (600s) have elapsed since the last iTunes cycle
         elapsed = time.time() - last_itunes_cycle_time
         if elapsed >= KEEP_ALIVE_INTERVAL:
@@ -1453,18 +1671,27 @@ def main():
         if open_ticket_from_notification(screen):
             screen = None
 
-        # 3. Claim and handle the newest ticket on screen
+        # 3. Claim every ticket on screen, then work through the claimed ones, oldest first.
+        #    Tickets that come in meanwhile are claimed right away and join the line.
         if locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True, screen=screen):
-            if process_ticket():
-                verified += 1
-                print(f"[COMPLETE] Verified {verified}" + (f"/{limit}" if limit else "") + ".")
-                if limit and verified >= limit:
-                    send_done_message()
-                    print("[COMPLETE] Verification goal reached. Bot is now exiting.")
-                    sys.exit(0)
-                # Get iTunes back to the Mobile Carrier form so the next ticket starts right away
-                run_itunes_reset_cycle(return_to_discord=True)
+            claim_new_tickets()
+        if work.waiting:
+            while work.waiting:
+                if len(work.waiting) > 1:
+                    print(f"[QUEUE] Next ticket ({len(work.waiting) - 1} more waiting after it).")
+                if work_on_ticket(work.waiting.popleft()):
+                    work.verified += 1
+                    print(f"[COMPLETE] Verified {work.verified}" + (f"/{limit}" if limit else "") + ".")
+                    if limit and work.verified >= limit:
+                        send_done_message()
+                        print("[COMPLETE] Verification goal reached. Bot is now exiting.")
+                        sys.exit(0)
+                    # Get iTunes back to the Mobile Carrier form so the next ticket starts right away
+                    run_itunes_reset_cycle(return_to_discord=True)
+                claim_new_tickets()
             print("[WAIT] Ticket finished. Watching Discord for the next ticket...")
+        elif "Discord" in get_active_window_title():
+            recheck_scale("discord", screen)  # notices a Discord zoom change while idle
 
         human_pause(0.15, 0.3)
 
