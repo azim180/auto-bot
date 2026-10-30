@@ -80,6 +80,17 @@ VALUE_BOX_RGB = (40, 41, 57)
 NUMBER_BOX_OFFSETS = (38, 110)
 CODE_BOX_OFFSETS = (31, 56)
 
+# The two Discord servers tickets come from, each with a #code-farm. Each has its own icon in
+# Discord's server list and its own new-ticket notification (server 1: green cash icon, blue/black
+# notification; server 2: grey cash icon, purple notification). Every ticket remembers its server,
+# so the bot can go back to it after claiming a ticket in the other one.
+SERVERS = {
+    "server 1 (green cash)": {"icon": "discord_server1_icon.png", "notification": "notif_new_ticket_blue.png"},
+    "server 2 (grey cash)": {"icon": "discord_server2_icon.png", "notification": "notif_new_ticket_purple.png"},
+}
+# The two icons look alike from afar; only a close match is taken as one of them
+SERVER_ICON_CONFIDENCE = 0.85
+
 # Where a Windows notification's X is, from the center of its "⋯ ✕" image or its Discord header
 NOTIF_CLOSE_FROM_DOTS = (20, 0)
 NOTIF_CLOSE_FROM_HEADER = (288, 0)
@@ -131,6 +142,8 @@ RECHECK_SECONDS = 20
 
 # Track the last time the iTunes Account -> Manage Payments -> Mobile Carrier cycle ran
 last_itunes_cycle_time = time.time()
+# The server Discord is showing, as far as the bot knows (it changes it itself: notifications, icons)
+current_server = None
 
 
 # ==============================================================================
@@ -882,6 +895,70 @@ def switch_to_itunes():
     recheck_scale("itunes")
 
 
+# ==============================================================================
+# DISCORD SERVERS (tickets come from two)
+# ==============================================================================
+def shown_server(screen=None):
+    """
+    Which of the two servers Discord is showing, from the white bar Discord draws left of the open
+    server's icon in the server list. None if it cannot tell.
+    """
+    screen = screen if screen is not None else grab_screen()
+    if screen is None:
+        return None
+    for server, images in SERVERS.items():
+        box = locate_box(images["icon"], confidence=SERVER_ICON_CONFIDENCE, screen=screen)
+        if box and _has_open_server_bar(screen, box):
+            return server
+    return None
+
+
+def _has_open_server_bar(screen, box):
+    """True if a tall white bar (the open server's) is left of the icon whose inner part is at `box`."""
+    left, top, width, height = box
+    cx, cy = left + width // 2, top + height // 2
+    half = px(16)  # half the whole icon, which is bigger than the inner part that was found
+    x0, x1 = max(0, cx - half - px(24)), max(0, cx - half)
+    y0, y1 = max(0, cy - half), cy + half
+    if x1 <= x0:
+        return False
+    strip = np.array(screen.crop((x0, y0, x1, y1)).convert("RGB"))
+    white_per_column = (strip.min(axis=2) >= 180).sum(axis=0)
+    # open: about as tall as the icon; hovered: half as tall; unread: a dot
+    return int(white_per_column.max()) >= 0.65 * (y1 - y0)
+
+
+def go_to_server(server, force=False):
+    """
+    Makes Discord show `server`'s channel by clicking its icon in the server list, unless the bot
+    knows it is already there. False if its icon cannot be found.
+    """
+    global current_server
+    if server is None or (server == current_server and not force):
+        return True
+    loc = locate_element(SERVERS[server]["icon"], confidence=SERVER_ICON_CONFIDENCE)
+    if not loc:
+        print(f"[WARN] Could not find {server}'s icon in Discord's server list")
+        return False
+    print(f"[SERVER] Going to {server}...")
+    human_click(loc.x, loc.y)
+    current_server = server
+    screen_w, screen_h = screen_size()
+    chat = (int(loc.x), 0, max(1, screen_w - int(loc.x)), screen_h)
+    wait_for_screen_settle(chat, settle=0.3, timeout=3)  # the channel finished loading
+    return True
+
+
+def learn_current_server():
+    """At startup: which server Discord is showing. If it cannot tell, it opens server 1."""
+    global current_server
+    current_server = shown_server()
+    if current_server:
+        print(f"[SERVER] Discord is showing {current_server}.")
+    elif not go_to_server(next(iter(SERVERS)), force=True):
+        print("[WARN] Server icons not found: tickets are only followed within the server on screen.")
+
+
 def notification_area():
     """Bottom-right quarter of the screen, where Windows notifications pop up and stack."""
     try:
@@ -892,22 +969,25 @@ def notification_area():
 
 
 def find_new_ticket_notification(screen=None):
-    """Where a new-ticket Windows notification is showing, or None."""
+    """(where, server) of a new-ticket Windows notification that is showing, or None."""
     toast_area = notification_area()
-    for image_name in ("notif_new_ticket_blue.png", "notif_new_ticket_purple.png"):
-        loc = locate_element(image_name, confidence=0.80, region=toast_area, screen=screen)
+    for server, images in SERVERS.items():
+        loc = locate_element(images["notification"], confidence=0.80, region=toast_area, screen=screen)
         if loc:
-            return loc
+            return loc, server
     return None
 
 
 def open_ticket_from_notification(screen=None):
     """Clicks a new-ticket Windows notification to jump to its channel. True if a Claim button shows up."""
-    loc = find_new_ticket_notification(screen)
-    if not loc:
+    global current_server
+    found = find_new_ticket_notification(screen)
+    if not found:
         return False
-    print("[NOTIFY] New ticket notification - opening its channel...")
+    loc, server = found
+    print(f"[NOTIFY] New ticket notification from {server} - opening its channel...")
     human_click(loc.x, loc.y)
+    current_server = server  # the notification opens that server's #code-farm
     wait_for_window("Discord")
     if wait_for_element("discord_claim_btn.png", timeout=6, confidence=CONFIDENCE, pick_bottom=True):
         return True
@@ -915,26 +995,21 @@ def open_ticket_from_notification(screen=None):
     return False
 
 
-def claim_from_notification(screen=None):
+def claim_from_notification(screen=None, back_to_itunes=True):
     """
-    While a ticket is being worked on in iTunes: if a new-ticket notification shows up, click it,
-    claim the new ticket in Discord, and come back to iTunes. True if it did; the caller then
-    carries on where it left off.
+    While a ticket is being worked on: if a new-ticket notification shows up, click it (that opens
+    its server's channel), claim the new ticket, and come back to iTunes (or, from Discord, let the
+    current ticket take the bot back to its own server). True if it did; the caller then carries
+    on where it left off.
     """
-    if work.current is None or not work.can_claim():
+    if work.current is None or not work.can_claim() or not find_new_ticket_notification(screen):
         return False
-    loc = find_new_ticket_notification(screen)
-    if not loc:
-        return False
-    print("[NOTIFY] New ticket while busy in iTunes - claiming it first...")
-    human_click(loc.x, loc.y)
-    wait_for_window("Discord")
-    if wait_for_element("discord_claim_btn.png", timeout=6, confidence=CONFIDENCE, pick_bottom=True):
+    print("[NOTIFY] New ticket while busy with another - claiming it first...")
+    if open_ticket_from_notification(screen):
         claim_new_tickets()
-    else:
-        print("[NOTIFY] Channel opened but no Claim button showed up")
-    print("[NOTIFY] Back to iTunes to carry on with the current ticket...")
-    switch_to_itunes()
+    if back_to_itunes:
+        print("[NOTIFY] Back to iTunes to carry on with the current ticket...")
+        switch_to_itunes()
     return True
 
 
@@ -1181,6 +1256,8 @@ def wait_for_user_code(ticket, timeout=CODE_WAIT_TIMEOUT, previous_code=None):
         if locate_element("notif_code_submitted.png", confidence=0.80, screen=screen):
             print("[DETECTED] Code submission notification seen!")
             switch_to_discord()
+        # A new ticket's notification (it may be in the other server): claim it, then come back
+        claim_from_notification(screen, back_to_itunes=False)
 
         # 2. Periodically check Discord embed directly (every ~4s) so we never miss a code
         if int(time.time() - start) % 4 == 0:
@@ -1255,27 +1332,38 @@ TICKET_AREA = dict(left=220, up=40, right=330, down=175)
 
 class Ticket:
     """
-    The ticket being worked on. Newer tickets push it up the chat or off screen, so it is found
-    again by a snapshot of its phone-number box, and its buttons are only looked for right there.
+    A claimed ticket. Newer tickets push it up the chat or off screen, so it is found again by a
+    snapshot of its phone-number box, and its buttons are only looked for right there. It also
+    remembers its server, and goes back there when the bot was in the other one.
     """
 
-    def __init__(self, left, right, y):
+    def __init__(self, left, right, y, server=None):
         self.fingerprint = grab_bgr((int(left), int(y) - px(6), int(right - left) + 1, px(13)))
         self.center = Point(int(left + right) // 2, int(y))
         self.scrolled = 0  # wheel notches the chat was scrolled up to keep the ticket in view
+        self.server = server
 
     def find(self):
-        """Where the ticket's number box is now, scrolling the chat up if newer messages hid it."""
+        """Where the ticket's number box is now: in its server, scrolling up if newer messages hid it."""
         if self.fingerprint is None:
             return None
         if "Discord" not in get_active_window_title():
             switch_to_discord()
-        for attempt in range(8):
+        go_to_server(self.server)
+        checked_server = told = False
+        for _ in range(8):
             loc = locate_template(self.fingerprint, 0.93)
             if loc:
                 self.center = loc
                 return loc
-            if attempt == 0:
+            if self.server and not checked_server:
+                checked_server = True
+                shown = shown_server()
+                if shown and shown != self.server:  # not where the bot thought: go to the right one
+                    go_to_server(self.server, force=True)
+                    continue
+            if not told:
+                told = True
                 print("[TICKET] Newer messages pushed the ticket out of view - scrolling up to it...")
             human_move(self.center.x, screen_size()[1] // 2)
             for _ in range(3):
@@ -1283,6 +1371,12 @@ class Ticket:
                 time.sleep(random.uniform(0.02, 0.05))
             self.scrolled += 3
             human_pause(0.25, 0.4)
+        # Last try: maybe Discord was showing the other server without the bot being able to tell
+        if self.server and go_to_server(self.server, force=True):
+            loc = locate_template(self.fingerprint, 0.93)
+            if loc:
+                self.center, self.scrolled = loc, 0
+                return loc
         print("[WARN] Lost track of the ticket")
         return None
 
@@ -1392,7 +1486,7 @@ def claim_ticket():
         print("[WARN] Could not find the ticket's Number. Leaving this ticket for a human.")
         return None
     box = find_value_box(number_label) or (number_label.x + px(NUMBER_BOX_OFFSETS[0]), number_label.x + px(NUMBER_BOX_OFFSETS[1]))
-    ticket = Ticket(box[0], box[1], number_label.y)
+    ticket = Ticket(box[0], box[1], number_label.y, server=current_server)
 
     if ticket.has_user_left():
         print("[LEFT] The user already left. Skipping this ticket.")
@@ -1655,6 +1749,7 @@ def main():
     work.limit = limit
     last_itunes_cycle_time = time.time()
     switch_to_discord()
+    learn_current_server()
 
     while True:
         # 0. Resolution or display scaling changed? Then every app is measured again

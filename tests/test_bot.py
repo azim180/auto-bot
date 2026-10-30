@@ -911,7 +911,7 @@ class TestTicketScrolling(unittest.TestCase):
         scrolls = []
         found = [None, None, bot.Point(186, 120)]
         ticket = bot.Ticket.__new__(bot.Ticket)
-        ticket.fingerprint, ticket.center, ticket.scrolled = object(), bot.Point(186, 500), 0
+        ticket.fingerprint, ticket.center, ticket.scrolled, ticket.server = object(), bot.Point(186, 500), 0, None
         with mock.patch.object(bot, "locate_template", lambda *a, **k: found.pop(0)), \
              mock.patch.object(bot, "get_active_window_title", lambda: "Discord"), \
              mock.patch.object(bot, "switch_to_discord", lambda: None), \
@@ -1213,30 +1213,38 @@ class TestClaimingNewTickets(_WorkState):
 
 class TestNewTicketWhileInItunes(_WorkState):
     """A new-ticket notification while working in iTunes: click it, claim, come back to iTunes."""
+    SERVER_1, SERVER_2 = list(bot.SERVERS)
 
-    def _run(self, toast, current="current ticket"):
+    def _run(self, toast, current="current ticket", back_to_itunes=True):
         from unittest import mock
         self.work.current = current
         steps = []
         with mock.patch.object(bot, "find_new_ticket_notification", lambda screen=None: toast), \
+             mock.patch.object(bot, "current_server", self.SERVER_1), \
              mock.patch.object(bot, "human_click", lambda x, y, **k: steps.append(("click", x, y))), \
              mock.patch.object(bot, "wait_for_window", lambda name, timeout=4: True), \
              mock.patch.object(bot, "wait_for_element", lambda name, **k: Point(300, 700)), \
-             mock.patch.object(bot, "claim_new_tickets", lambda: steps.append("claim")), \
+             mock.patch.object(bot, "claim_new_tickets", lambda: steps.append(("claim in", bot.current_server))), \
              mock.patch.object(bot, "switch_to_itunes", lambda: steps.append("back to iTunes")), \
              mock.patch("builtins.print"):
-            return bot.claim_from_notification(), steps
+            return bot.claim_from_notification(back_to_itunes=back_to_itunes), steps
 
     def test_claims_then_goes_back_to_itunes(self):
-        went, steps = self._run(Point(1300, 750))
+        went, steps = self._run((Point(1300, 750), self.SERVER_2))
         self.assertTrue(went)
-        self.assertEqual(steps, [("click", 1300, 750), "claim", "back to iTunes"])
+        self.assertEqual(steps, [("click", 1300, 750), ("claim in", self.SERVER_2), "back to iTunes"])
+
+    def test_from_discord_it_stays_there(self):
+        # waiting for a code in Discord: the current ticket itself goes back to its server
+        went, steps = self._run((Point(1300, 750), self.SERVER_2), back_to_itunes=False)
+        self.assertTrue(went)
+        self.assertEqual(steps, [("click", 1300, 750), ("claim in", self.SERVER_2)])
 
     def test_nothing_happens_without_a_notification(self):
         self.assertEqual(self._run(None), (False, []))
 
     def test_left_alone_when_no_ticket_is_being_worked_on(self):
-        self.assertEqual(self._run(Point(1300, 750), current=None), (False, []))
+        self.assertEqual(self._run((Point(1300, 750), self.SERVER_2), current=None), (False, []))
 
     def test_itunes_wait_carries_on_after_claiming(self):
         from unittest import mock
@@ -1307,6 +1315,126 @@ class TestChangingTheScreenWhileRunning(unittest.TestCase):
         bot._last_seen_ok["discord"] = bot.time.time()
         with mock.patch.object(bot, "grab_screen", lambda: self.fail("checked again too soon")):
             self.assertTrue(bot.recheck_scale("discord"))
+
+
+@unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
+class TestTwoServers(unittest.TestCase):
+    """Tickets come from two servers; each ticket remembers its own and the bot goes back to it."""
+    SERVER_1, SERVER_2 = list(bot.SERVERS)
+
+    def _image(self, name):
+        from PIL import Image
+        return Image.open(bot.img_path(name)).convert("RGB")
+
+    def _sidebar(self, bar_next_to=None, bar_height=32):
+        """Discord's server list: server 1's icon, then server 2's; a white bar marks the open one."""
+        from PIL import Image, ImageDraw
+        screen = Image.new("RGB", (1440, 900), (49, 51, 56))
+        draw = ImageDraw.Draw(screen)
+        draw.rectangle((0, 0, 71, 899), fill=(18, 18, 20))
+        centers = {self.SERVER_1: (36, 120), self.SERVER_2: (36, 170)}
+        for server, (cx, cy) in centers.items():
+            draw.rounded_rectangle((cx - 15, cy - 15, cx + 15, cy + 15), radius=8, fill=(240, 240, 240))
+            icon = self._image(bot.SERVERS[server]["icon"])
+            screen.paste(icon, (cx - icon.width // 2, cy - icon.height // 2))
+        if bar_next_to:
+            cy = centers[bar_next_to][1]
+            draw.rectangle((0, cy - bar_height // 2, 3, cy + bar_height // 2), fill=(242, 243, 245))
+        return screen, centers
+
+    def test_notification_colour_tells_the_server(self):
+        from PIL import Image
+        for server in (self.SERVER_1, self.SERVER_2):
+            screen = Image.new("RGB", (1440, 900), (40, 40, 40))
+            screen.paste(self._image(bot.SERVERS[server]["notification"]), (1100, 760))
+            loc, found = bot.find_new_ticket_notification(screen)
+            self.assertEqual(found, server)
+
+    def test_the_two_icons_are_never_mixed_up(self):
+        from PIL import Image
+        for server, other in ((self.SERVER_1, self.SERVER_2), (self.SERVER_2, self.SERVER_1)):
+            screen = Image.new("RGB", (400, 300), (18, 18, 20))
+            screen.paste(self._image(bot.SERVERS[other]["icon"]), (100, 100))
+            self.assertIsNone(bot.locate_element(bot.SERVERS[server]["icon"],
+                                                 confidence=bot.SERVER_ICON_CONFIDENCE, screen=screen))
+            self.assertIsNotNone(bot.locate_element(bot.SERVERS[other]["icon"],
+                                                    confidence=bot.SERVER_ICON_CONFIDENCE, screen=screen))
+
+    def test_the_open_server_is_the_one_with_the_white_bar(self):
+        for server in (self.SERVER_1, self.SERVER_2):
+            screen, _ = self._sidebar(bar_next_to=server)
+            self.assertEqual(bot.shown_server(screen), server)
+        self.assertIsNone(bot.shown_server(self._sidebar()[0]))
+        # a short bar only means unread messages (or the mouse is over it), not that it is open
+        self.assertIsNone(bot.shown_server(self._sidebar(bar_next_to=self.SERVER_1, bar_height=8)[0]))
+
+    def test_goes_to_a_server_by_clicking_its_icon_only_when_needed(self):
+        from unittest import mock
+        screen, centers = self._sidebar()
+        clicks = []
+        with mock.patch.object(bot.pyautogui, "screenshot", lambda region=None: screen if region is None else
+                               screen.crop((region[0], region[1], region[0] + region[2], region[1] + region[3])),
+                               create=True), \
+             mock.patch.object(bot, "current_server", self.SERVER_1), \
+             mock.patch.object(bot, "human_click", lambda x, y, **k: clicks.append((x, y))), \
+             mock.patch.object(bot, "wait_for_screen_settle", lambda *a, **k: True), \
+             mock.patch("builtins.print"):
+            self.assertTrue(bot.go_to_server(self.SERVER_1))
+            self.assertEqual(clicks, [])
+            self.assertTrue(bot.go_to_server(self.SERVER_2))
+            self.assertEqual(bot.current_server, self.SERVER_2)
+        self.assertEqual(len(clicks), 1)
+        self.assertLessEqual(abs(clicks[0][0] - centers[self.SERVER_2][0]), 2)
+        self.assertLessEqual(abs(clicks[0][1] - centers[self.SERVER_2][1]), 2)
+
+    def _find(self, ticket_server, tracked, shown, found):
+        from unittest import mock
+        ticket = bot.Ticket.__new__(bot.Ticket)
+        ticket.fingerprint, ticket.center, ticket.scrolled, ticket.server = object(), Point(400, 500), 0, ticket_server
+        trips = []
+        with mock.patch.object(bot, "current_server", tracked), \
+             mock.patch.object(bot, "get_active_window_title", lambda: "Discord"), \
+             mock.patch.object(bot, "go_to_server", lambda s, force=False: trips.append((s, force)) or True), \
+             mock.patch.object(bot, "shown_server", lambda screen=None: shown), \
+             mock.patch.object(bot, "locate_template", lambda *a, **k: found.pop(0) if found else None), \
+             mock.patch.object(bot, "human_move", lambda *a, **k: None), \
+             mock.patch.object(bot, "human_pause", lambda *a, **k: None), \
+             mock.patch.object(bot.time, "sleep", lambda s: None), \
+             mock.patch("builtins.print"):
+            return ticket.find(), trips
+
+    def test_ticket_takes_the_bot_back_to_its_server(self):
+        loc, trips = self._find(self.SERVER_1, tracked=self.SERVER_2, shown=None, found=[Point(400, 300)])
+        self.assertEqual(loc, Point(400, 300))
+        self.assertEqual(trips, [(self.SERVER_1, False)])
+
+    def test_ticket_notices_discord_shows_the_other_server(self):
+        loc, trips = self._find(self.SERVER_1, tracked=self.SERVER_1, shown=self.SERVER_2,
+                                found=[None, Point(400, 300)])
+        self.assertEqual(loc, Point(400, 300))
+        self.assertEqual(trips, [(self.SERVER_1, False), (self.SERVER_1, True)])
+
+    def test_ticket_without_a_server_works_as_before(self):
+        loc, trips = self._find(None, tracked=None, shown=None, found=[Point(400, 300)])
+        self.assertEqual(loc, Point(400, 300))
+        self.assertEqual(trips, [(None, False)])
+
+    def test_claimed_ticket_remembers_the_server_it_was_claimed_in(self):
+        from unittest import mock
+        found = {"discord_claim_btn.png": [Point(300, 700), Point(300, 700)], "discord_number_label.png": [Point(200, 600)]}
+        with mock.patch.object(bot, "current_server", self.SERVER_2), \
+             mock.patch.object(bot, "locate_element", lambda name, **k: (found.get(name) or [None]).pop(0)), \
+             mock.patch.object(bot, "wait_for_element", lambda name, **k: (found.get(name) or [None]).pop(0)), \
+             mock.patch.object(bot, "wait_for_screen_settle", lambda *a, **k: True), \
+             mock.patch.object(bot, "has_returning_user_warning", lambda region: False), \
+             mock.patch.object(bot, "human_click", lambda *a, **k: None), \
+             mock.patch.object(bot, "wait_for_claim_to_register", lambda loc: Point(300, 700)), \
+             mock.patch.object(bot, "find_value_box", lambda label: (238, 310)), \
+             mock.patch.object(bot, "grab_bgr", lambda region: object()), \
+             mock.patch.object(bot.Ticket, "has_user_left", lambda self: False), \
+             mock.patch("builtins.print"):
+            ticket = bot.claim_ticket()
+        self.assertEqual(ticket.server, self.SERVER_2)
 
 
 class TestDisplayScale(unittest.TestCase):

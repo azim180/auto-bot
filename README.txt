@@ -59,6 +59,15 @@ and while it is in iTunes a new-ticket notification is clicked, the ticket
 claimed, and the bot goes back to iTunes and carries on where it was. Claimed
 tickets are then handled one after another, oldest first (never more than
 the verification goal needs).
+Tickets come from two Discord servers, each with a #code-farm:
+  server 1 - green cash icon, blue/black notification ("Verification")
+  server 2 - grey cash icon, purple notification ("Verification+")
+Every claimed ticket remembers its server. When the bot needs a ticket that
+is in the other server (after claiming one from a notification, say), it
+clicks that server's icon in Discord's server list and carries on there.
+At startup it reads which server is open from the white bar Discord draws
+next to it (or opens server 1). The icons are images/discord_server1_icon.png
+and discord_server2_icon.png - re-crop them if a server changes its icon.
 While another claimed ticket is waiting, the current user gets one try: no
 code within 1 minute, or a wrong code, and the ticket is failed right away so
 the next one can start. With nobody else waiting it is as before: 2 minutes,
