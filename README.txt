@@ -15,6 +15,9 @@ HOW TO RUN:
 3. Open Discord (the right Discord icon on your taskbar, inside #code-farm)
    and open iTunes in the background.
 4. Double-click "start_bot.bat" (or run `python bot.py` in terminal).
+5. It asks how many verifications to do: type 1, 2, 3 ... or just press Enter
+   for no limit. After that many verifications it types "im the bot and done"
+   and stops. (Shortcut: `python bot.py 2` skips the question.)
 
 SAFETY STOP:
 Slam your mouse cursor into ANY of the 4 corners of your monitor at any
