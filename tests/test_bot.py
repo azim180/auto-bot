@@ -184,13 +184,16 @@ def _fake_screenshot(img):
         (region[0], region[1], region[0] + region[2], region[1] + region[3]))
 
 
-def _ticket_row(box_left=150, box_right=222, y=120):
+TIMESTAMP_BOX_RGB = (54, 54, 60)  # Discord's "17 seconds ago" highlight, measured from a screenshot
+
+
+def _ticket_row(box_left=150, box_right=222, y=120, box_rgb=None):
     """A Discord embed row: embed background with the grey value box and some 'text' inside it."""
     from PIL import Image
     img = Image.new("RGB", (400, 200), (36, 36, 41))
     for x in range(box_left, box_right + 1):
         for yy in range(y - 6, y + 7):
-            img.putpixel((x, yy), bot.VALUE_BOX_RGB)
+            img.putpixel((x, yy), box_rgb or bot.VALUE_BOX_RGB)
     for x in range(box_left + 3, box_right - 3, 3):
         for yy in range(y - 3, y + 4):
             img.putpixel((x, yy), (220, 220, 225))
@@ -226,6 +229,12 @@ class TestFindValueBox(unittest.TestCase):
         from unittest import mock
         with mock.patch.object(bot.pyautogui, "screenshot", _fake_screenshot(_ticket_row()), create=True):
             self.assertEqual(bot.find_value_box(Point(111, 120)), (150, 222))
+
+    def test_timer_highlight_is_not_a_code_box(self):
+        from unittest import mock
+        timer_row = _ticket_row(box_rgb=TIMESTAMP_BOX_RGB)
+        with mock.patch.object(bot.pyautogui, "screenshot", _fake_screenshot(timer_row), create=True):
+            self.assertIsNone(bot.find_value_box(Point(111, 120)))
 
     def test_returns_none_without_a_box(self):
         from unittest import mock
@@ -280,6 +289,14 @@ class TestCopyTicketValue(unittest.TestCase):
         self.assertEqual(number, "06 12 36 54 85")
         self.assertEqual(self.clicks, [2, 2])
         self.assertEqual(self.drags, [])
+
+    def test_code_is_not_clicked_while_the_timer_shows(self):
+        from unittest import mock
+        with mock.patch.object(bot, "find_value_box", lambda label: None):
+            code = bot.copy_ticket_value("discord_code_label.png", (0, 0, 400, 200), bot.extract_code,
+                                         bot.CODE_BOX_OFFSETS, require_box=True)
+        self.assertEqual(code, "")
+        self.assertEqual(self.clicks, [])
 
     def test_gives_up_with_empty_string(self):
         self.clipboard = ["36", "54"]
@@ -409,6 +426,16 @@ class TestActionMenuUsesNewestTicket(unittest.TestCase):
 
 @unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
 class TestBestMatch(unittest.TestCase):
+    def test_shared_screenshot_gives_the_same_answer(self):
+        from PIL import Image
+        button = Image.open(bot.img_path("itunes_add_payment_btn.png")).convert("RGB")
+        screen = self._screen_with([(button, (1056, 377))])
+        self.assertEqual(bot.locate_element("itunes_add_payment_btn.png", confidence=0.88, screen=screen),
+                         self._locate(screen, "itunes_add_payment_btn.png", confidence=0.88))
+        self.assertEqual(bot.locate_element("itunes_add_payment_btn.png", confidence=0.88, screen=screen,
+                                            region=(1000, 300, 300, 200)),
+                         bot.Point(1056 + button.width // 2, 377 + button.height // 2))
+
     """locate_element must return the best match, not the first lookalike in reading order."""
 
     def _screen_with(self, placements, size=(1440, 900), bg=(255, 255, 255)):
@@ -454,6 +481,24 @@ class TestBestMatch(unittest.TestCase):
             self.assertIsNone(self._locate(screen, "does_not_exist.png"))
 
 
+class TestClipboard(unittest.TestCase):
+    def test_uses_pyperclip_when_available(self):
+        from unittest import mock
+        fake = mock.Mock()
+        fake.paste.return_value = "06 12 36 54 85"
+        with mock.patch.object(bot, "pyperclip", fake):
+            self.assertEqual(bot.get_clipboard_text(), "06 12 36 54 85")
+            bot.set_clipboard_text("1122")
+        fake.copy.assert_called_once_with("1122")
+
+    def test_falls_back_when_pyperclip_fails(self):
+        from unittest import mock
+        fake = mock.Mock()
+        fake.paste.side_effect = RuntimeError("clipboard busy")
+        with mock.patch.object(bot, "pyperclip", fake):
+            self.assertEqual(bot.get_clipboard_text(), "")  # the tkinter stub's clipboard is empty
+
+
 class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
     def test_waits_until_the_code_changes(self):
         from unittest import mock
@@ -466,6 +511,18 @@ class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
              mock.patch.object(bot.time, "sleep", lambda s: None), \
              mock.patch("builtins.print"):
             self.assertEqual(bot.wait_for_user_code(timeout=5, previous_code="1122"), "4567")
+
+    def test_waits_while_the_timer_shows_then_takes_the_code(self):
+        from unittest import mock
+        codes = ["", "", "1246"]  # "" = no code box yet (timer showing), so nothing was clicked
+        with mock.patch.object(bot, "locate_element",
+                               lambda name, **k: Point(100, 200) if name == "discord_mark_verified_btn.png" else None), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "wait_for_screen_settle", lambda *a, **k: True), \
+             mock.patch.object(bot, "copy_ticket_value", lambda *a, **k: codes.pop(0)), \
+             mock.patch.object(bot.time, "sleep", lambda s: None), \
+             mock.patch("builtins.print"):
+            self.assertEqual(bot.wait_for_user_code(timeout=5, previous_code="1122"), "1246")
 
 
 if __name__ == "__main__":
