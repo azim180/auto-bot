@@ -505,7 +505,7 @@ class TestClipboard(unittest.TestCase):
             self.assertEqual(bot.get_clipboard_text(), "")  # the tkinter stub's clipboard is empty
 
 
-FAKE_TICKET = types.SimpleNamespace(region=lambda: (0, 0, 400, 300))
+FAKE_TICKET = types.SimpleNamespace(region=lambda: (0, 0, 400, 300), scrolled=0, back_to_bottom=lambda: None)
 
 
 class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
@@ -788,6 +788,7 @@ class TestBackupSpots(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(bot.pyautogui, "size", lambda: size, create=True))
             stack.enter_context(mock.patch.object(bot, "display_scale", lambda: scale))
+            stack.enter_context(mock.patch.object(bot, "watch_screen", lambda: False))
             for p in extra:
                 stack.enter_context(p)
             return fn()
@@ -1077,6 +1078,274 @@ class TestAnySize(unittest.TestCase):
         self.assertIn("125%", text)
         self.assertIn("not on screen yet", text)
         self.assertEqual(bot.ui_scale["discord"], 1.25)
+
+
+class _Clock:
+    """Fake time for the bot: only moves when the bot sleeps (or a test says so)."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def patch(self):
+        from unittest import mock
+        return mock.patch.object(bot, "time", types.SimpleNamespace(time=self.time, sleep=self.sleep))
+
+
+class _WorkState(unittest.TestCase):
+    """Starts each test with no ticket in hand and no verification goal."""
+
+    def setUp(self):
+        from unittest import mock
+        self.work = bot.Work()
+        patcher = mock.patch.object(bot, "work", self.work)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestOneTryWhileAnotherTicketWaits(_WorkState):
+    """With another claimed ticket waiting, the current user gets 1 minute and one code."""
+
+    def _wait(self, claim_at=None, timeout=120):
+        from unittest import mock
+        clock = _Clock()
+
+        def sweep():
+            if claim_at is not None and clock.now - 1000 >= claim_at and not self.work.waiting:
+                self.work.waiting.append("next ticket")
+
+        with clock.patch(), \
+             mock.patch.object(bot, "locate_element", lambda *a, **k: None), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "watch_screen", lambda: False), \
+             mock.patch.object(bot, "claim_new_tickets", sweep), \
+             mock.patch("builtins.print"):
+            code = bot.wait_for_user_code(FAKE_TICKET, timeout=timeout)
+        return code, clock.now - 1000
+
+    def test_waits_the_full_two_minutes_when_nobody_else_waits(self):
+        code, waited = self._wait()
+        self.assertIsNone(code)
+        self.assertGreaterEqual(waited, 120)
+
+    def test_gives_up_after_one_minute_when_another_ticket_waits(self):
+        self.work.waiting.append("next ticket")
+        code, waited = self._wait()
+        self.assertIsNone(code)
+        self.assertTrue(60 <= waited < 62, waited)
+
+    def test_ticket_claimed_after_the_first_minute_ends_the_wait_at_once(self):
+        code, waited = self._wait(claim_at=90)
+        self.assertIsNone(code)
+        self.assertTrue(90 <= waited < 95, waited)
+
+    def _verify_with_wrong_code(self):
+        """verify_with_itunes where the user's first code is wrong. Returns (result, what happened)."""
+        from unittest import mock
+        done = []
+        ticket = types.SimpleNamespace(
+            choose_action=lambda item: done.append(item) or True,
+            click_button=lambda image, what, **k: done.append(image) or True)
+        outcomes = ["itunes_enter_code_input.png", "itunes_unable_to_verify_code.png", None]
+        with mock.patch.object(bot, "switch_to_itunes", lambda: None), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "claim_from_notification", lambda screen=None: False), \
+             mock.patch.object(bot, "wait_for_element", lambda name, **k: Point(500, 300)), \
+             mock.patch.object(bot, "human_click", lambda *a, **k: None), \
+             mock.patch.object(bot, "replace_field_text", lambda text: None), \
+             mock.patch.object(bot, "human_scroll", lambda n: None), \
+             mock.patch.object(bot, "remember_spot", lambda *a: None), \
+             mock.patch.object(bot, "spot", lambda name: (580, 300)), \
+             mock.patch.object(bot, "click_itunes_submit", lambda name: True), \
+             mock.patch.object(bot, "wait_for_any", lambda *a, **k: outcomes.pop(0)), \
+             mock.patch.object(bot, "wait_for_user_code", lambda *a, **k: "1234" if not done else None), \
+             mock.patch.object(bot, "click_element", lambda name, **k: done.append(name) or Point(1, 1)), \
+             mock.patch.object(bot, "run_itunes_reset_cycle", lambda **k: done.append("reset iTunes")), \
+             mock.patch("builtins.print"):
+            return bot.verify_with_itunes(ticket, "06 12 36 54 85"), done
+
+    def test_wrong_code_fails_at_once_when_another_ticket_waits(self):
+        self.work.waiting.append("next ticket")
+        ok, done = self._verify_with_wrong_code()
+        self.assertFalse(ok)
+        self.assertIn("discord_failed_verification_btn.png", done)
+        self.assertNotIn("discord_menu_resend_code.png", done)
+        self.assertNotIn("itunes_didnt_get_code_link.png", done)
+        self.assertEqual(done[-1], "reset iTunes")
+
+    def test_wrong_code_gets_a_resend_when_nobody_else_waits(self):
+        ok, done = self._verify_with_wrong_code()
+        self.assertFalse(ok)
+        self.assertIn("itunes_didnt_get_code_link.png", done)
+        self.assertIn("discord_menu_resend_code.png", done)
+        self.assertNotIn("discord_failed_verification_btn.png", done)
+
+
+class TestClaimingNewTickets(_WorkState):
+    def _sweep(self, new_tickets, claim_shows=True):
+        from unittest import mock
+        new_tickets = list(new_tickets)
+        with mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "locate_element", lambda name, **k: Point(300, 700) if claim_shows else None), \
+             mock.patch.object(bot, "claim_ticket", lambda: new_tickets.pop(0) if new_tickets else None), \
+             mock.patch("builtins.print"):
+            return bot.claim_new_tickets()
+
+    def test_claims_every_new_ticket_and_lines_them_up_oldest_first(self):
+        self.work.waiting.append("A")
+        # the newest ticket (lowest on screen) is claimed first
+        self.assertEqual(self._sweep(["D", "C", "B"]), 3)
+        self.assertEqual(list(self.work.waiting), ["A", "B", "C", "D"])
+
+    def test_claims_no_more_than_the_verification_goal_needs(self):
+        self.work.limit, self.work.verified, self.work.current = 3, 1, "current ticket"
+        self._sweep(["C", "B", "A"])
+        self.assertEqual(list(self.work.waiting), ["C"])
+
+    def test_a_claim_that_does_not_go_through_is_not_retried_forever(self):
+        self.assertEqual(self._sweep([None] * 50), 0)
+
+
+class TestNewTicketWhileInItunes(_WorkState):
+    """A new-ticket notification while working in iTunes: click it, claim, come back to iTunes."""
+
+    def _run(self, toast, current="current ticket"):
+        from unittest import mock
+        self.work.current = current
+        steps = []
+        with mock.patch.object(bot, "find_new_ticket_notification", lambda screen=None: toast), \
+             mock.patch.object(bot, "human_click", lambda x, y, **k: steps.append(("click", x, y))), \
+             mock.patch.object(bot, "wait_for_window", lambda name, timeout=4: True), \
+             mock.patch.object(bot, "wait_for_element", lambda name, **k: Point(300, 700)), \
+             mock.patch.object(bot, "claim_new_tickets", lambda: steps.append("claim")), \
+             mock.patch.object(bot, "switch_to_itunes", lambda: steps.append("back to iTunes")), \
+             mock.patch("builtins.print"):
+            return bot.claim_from_notification(), steps
+
+    def test_claims_then_goes_back_to_itunes(self):
+        went, steps = self._run(Point(1300, 750))
+        self.assertTrue(went)
+        self.assertEqual(steps, [("click", 1300, 750), "claim", "back to iTunes"])
+
+    def test_nothing_happens_without_a_notification(self):
+        self.assertEqual(self._run(None), (False, []))
+
+    def test_left_alone_when_no_ticket_is_being_worked_on(self):
+        self.assertEqual(self._run(Point(1300, 750), current=None), (False, []))
+
+    def test_itunes_wait_carries_on_after_claiming(self):
+        from unittest import mock
+        clock = _Clock()
+        claims = [True]
+
+        def claim(screen=None):
+            if claims:
+                clock.now += 5  # the trip to Discord and back
+                return claims.pop()
+            return False
+
+        # iTunes shows the code form 12s in: past the 10s timeout, but 5s of it were spent claiming
+        with clock.patch(), \
+             mock.patch.object(bot, "grab_screen", lambda: None), \
+             mock.patch.object(bot, "locate_element", lambda name, **k: Point(1, 1) if clock.now - 1000 >= 12 else None), \
+             mock.patch.object(bot, "claim_from_notification", claim):
+            self.assertEqual(bot.wait_for_any([("itunes_enter_code_input.png", 0.8)], timeout=10, watch_tickets=True),
+                             "itunes_enter_code_input.png")
+
+
+@unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
+class TestChangingTheScreenWhileRunning(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(bot.ui_scale), set(bot.scale_confirmed), bot._screen_seen
+
+    def tearDown(self):
+        bot.ui_scale.update(self.saved[0])
+        bot.scale_confirmed.clear()
+        bot.scale_confirmed.update(self.saved[1])
+        bot._screen_seen = self.saved[2]
+        bot._spots = None
+        for cache in (bot._scaled_templates, bot._last_calibration, bot._calibration_searches, bot._last_seen_ok):
+            cache.clear()
+
+    def test_new_resolution_or_scaling_is_noticed_and_everything_measured_again(self):
+        from unittest import mock
+        with mock.patch.object(bot.pyautogui, "size", lambda: (1440, 900), create=True), \
+             mock.patch.object(bot, "display_scale", lambda: 1.0):
+            bot._screen_seen = None
+            self.assertFalse(bot.watch_screen())
+        with mock.patch.object(bot.pyautogui, "size", lambda: (1920, 1080), create=True), \
+             mock.patch.object(bot, "display_scale", lambda: 1.25), \
+             mock.patch("builtins.print"):
+            self.assertTrue(bot.watch_screen())
+            self.assertFalse(bot.watch_screen())
+        self.assertEqual(bot.scale_confirmed, set())
+        self.assertEqual(bot.ui_scale["discord"], 1.25)
+        self.assertIsNone(bot._spots)
+
+    def test_discord_zoom_change_is_noticed(self):
+        from unittest import mock
+        from PIL import Image
+        screen = Image.new("RGB", (1920, 1080), (49, 51, 56))
+        for name, xy in (("discord_chat_input.png", (400, 1000)), ("discord_claim_btn.png", (700, 600))):
+            image = Image.open(bot.img_path(name)).convert("RGB")
+            screen.paste(image.resize((round(image.width * 1.1), round(image.height * 1.1)), Image.LANCZOS), xy)
+        bot.ui_scale["discord"] = 1.0
+        bot.scale_confirmed.add("discord")
+        bot._last_seen_ok["discord"] = 0  # its images have not matched for a long time
+        with mock.patch.object(bot, "display_scale", lambda: 1.0), mock.patch("builtins.print"):
+            self.assertTrue(bot.recheck_scale("discord", screen))
+        self.assertEqual(bot.ui_scale["discord"], 1.1)
+
+    def test_no_extra_work_while_the_images_keep_matching(self):
+        from unittest import mock
+        bot.scale_confirmed.add("discord")
+        bot._last_seen_ok["discord"] = bot.time.time()
+        with mock.patch.object(bot, "grab_screen", lambda: self.fail("checked again too soon")):
+            self.assertTrue(bot.recheck_scale("discord"))
+
+
+class TestDisplayScale(unittest.TestCase):
+    """The scaling is read live from the main monitor, so a change while the bot runs is seen."""
+
+    def _windll(self, monitor_dpi=None, system_dpi=None):
+        import ctypes
+
+        def get_dpi_for_monitor(monitor, kind, dpi_x, dpi_y):
+            if monitor_dpi is None:
+                raise OSError("no shcore")
+            dpi_x._obj.value = dpi_y._obj.value = monitor_dpi
+            return 0
+
+        def get_dpi_for_system():
+            if system_dpi is None:
+                raise OSError("no GetDpiForSystem")
+            return system_dpi
+
+        def monitor_from_point(point, flags):
+            return 12345
+
+        # plain functions, so the bot can set ctypes' restype/argtypes on them like on the real ones
+        user32 = types.SimpleNamespace(MonitorFromPoint=monitor_from_point, GetDpiForSystem=get_dpi_for_system)
+        shcore = types.SimpleNamespace(GetDpiForMonitor=get_dpi_for_monitor)
+        from unittest import mock
+        return mock.patch.object(ctypes, "windll", types.SimpleNamespace(user32=user32, shcore=shcore), create=True)
+
+    def test_reads_the_monitor_scaling_now(self):
+        with self._windll(monitor_dpi=120, system_dpi=96):
+            self.assertEqual(bot.display_scale(), 1.25)
+        with self._windll(monitor_dpi=144, system_dpi=96):
+            self.assertEqual(bot.display_scale(), 1.5)
+
+    def test_older_windows_and_other_systems(self):
+        with self._windll(monitor_dpi=None, system_dpi=120):
+            self.assertEqual(bot.display_scale(), 1.25)
+        with self._windll():
+            self.assertEqual(bot.display_scale(), 1.0)
 
 
 def mock_print():
