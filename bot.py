@@ -19,12 +19,12 @@ except ImportError:
 Point = collections.namedtuple("Point", "x y")
 
 # ==============================================================================
-# CONFIGURATION (1440 x 900 Resolution @ 100% Scale)
+# CONFIGURATION (Windows display scaling 100%)
 # ==============================================================================
 pyautogui.FAILSAFE = True   # Slam mouse into any of the 4 screen corners to abort
 pyautogui.PAUSE = 0.03      # Base pause; the human_* helpers add small randomized waits on top
 
-IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+IMAGES_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
 CONFIDENCE = 0.84
 # The "Add Payment Method" label left of the Add Payment button scores ~0.81 against it
 ADD_PAYMENT_CONFIDENCE = 0.88
@@ -49,19 +49,37 @@ CODE_BOX_OFFSETS = (31, 56)
 NOTIF_CLOSE_FROM_DOTS = (20, 0)
 NOTIF_CLOSE_FROM_HEADER = (288, 0)
 
-# Exact 1440x900 fallback coordinates (used if an element is slightly faded)
-COORDS_1440x900 = {
-    "taskbar_discord_right": (561, 878),
-    "taskbar_itunes": (870, 878),
-    "itunes_menu_account": (225, 53),
-    "itunes_manage_payments": (1020, 288),
-    "itunes_mobile_carrier": (730, 281),
-    "itunes_phone_input_box": (535, 330),
-    "itunes_submit_phone": (1207, 737),
-    "itunes_enter_code_box": (535, 253),
-    "itunes_didnt_get_code": (601, 299),
-    "itunes_submit_code": (1221, 375),
+# Screen resolutions the bot can run on, chosen at startup. Each has its own images in
+# images/<name>/; an image missing there is borrowed from images/1440x900/ (at 100% display
+# scaling Discord and iTunes draw their buttons the same size on any screen).
+# "coords" are blind fallback clicks for when an image is not found. They were measured on
+# 1440x900 only, so other resolutions click only what they actually find on screen.
+BASE_PROFILE = "1440x900"
+PROFILES = {
+    "1440x900": {
+        "taskbar_discord_region": (450, 845, 200, 55),
+        "taskbar_itunes_region": (750, 845, 200, 55),
+        "coords": {
+            "taskbar_discord_right": (561, 878),
+            "taskbar_itunes": (870, 878),
+            "itunes_menu_account": (225, 53),
+            "itunes_manage_payments": (1020, 288),
+            "itunes_mobile_carrier": (730, 281),
+            "itunes_phone_input_box": (535, 330),
+            "itunes_submit_phone": (1207, 737),
+            "itunes_enter_code_box": (535, 253),
+            "itunes_didnt_get_code": (601, 299),
+            "itunes_submit_code": (1221, 375),
+        },
+    },
+    "1920x1080": {
+        "taskbar_discord_region": None,  # None = search the whole taskbar
+        "taskbar_itunes_region": None,
+        "coords": {},
+    },
 }
+profile_name = BASE_PROFILE
+PROFILE = PROFILES[BASE_PROFILE]
 
 # Track the last time the iTunes Account -> Manage Payments -> Mobile Carrier cycle ran
 last_itunes_cycle_time = time.time()
@@ -71,7 +89,37 @@ last_itunes_cycle_time = time.time()
 # HELPER FUNCTIONS
 # ==============================================================================
 def img_path(filename):
-    return os.path.join(IMG_DIR, filename)
+    """The active resolution's copy of an image, or the 1440x900 one if it has none."""
+    own = os.path.join(IMAGES_ROOT, profile_name, filename)
+    if profile_name == BASE_PROFILE or os.path.exists(own):
+        return own
+    return os.path.join(IMAGES_ROOT, BASE_PROFILE, filename)
+
+
+def select_profile(name):
+    global profile_name, PROFILE
+    profile_name, PROFILE = name, PROFILES[name]
+    _templates.clear()
+
+
+def coord(name):
+    """Measured fallback click spot for the active resolution, or None if there is none."""
+    return PROFILE["coords"].get(name)
+
+
+def screen_size():
+    try:
+        return tuple(pyautogui.size())
+    except Exception:
+        return (1440, 900)
+
+
+def taskbar_region(key):
+    region = PROFILE[key]
+    if region:
+        return region
+    screen_w, screen_h = screen_size()
+    return (0, screen_h - 60, screen_w, 60)
 
 
 def get_active_window_title():
@@ -159,7 +207,7 @@ def _load_template(image_name):
             # imdecode instead of imread so folders with non-ASCII names still work
             _templates[image_name] = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         else:
-            print(f"[WARN] Missing image: images/{image_name}")
+            print(f"[WARN] Missing image: images/{profile_name}/{image_name}")
             _templates[image_name] = None
     return _templates[image_name]
 
@@ -433,9 +481,12 @@ def switch_to_discord():
     if "Discord" in title or locate_element("discord_chat_input.png", confidence=0.80):
         return
     print("[SWITCH] Clicking Right Discord icon on taskbar...")
-    # Look in the taskbar region (bottom 55 pixels of 1440x900 screen)
-    loc = locate_element("taskbar_discord_right.png", confidence=0.80, region=(450, 845, 200, 55))
-    human_click(*(loc or COORDS_1440x900["taskbar_discord_right"]))
+    loc = locate_element("taskbar_discord_right.png", confidence=0.80, region=taskbar_region("taskbar_discord_region"))
+    target = loc or coord("taskbar_discord_right")
+    if not target:
+        print("[WARN] Could not find the Discord icon on the taskbar")
+        return
+    human_click(*target)
     if not wait_for_window("Discord"):
         print("[WARN] Discord window did not come to the front")
     human_pause(0.12, 0.25)  # let it repaint
@@ -447,8 +498,12 @@ def switch_to_itunes():
     if "iTunes" in title or locate_element("itunes_menu_account.png", confidence=0.82):
         return
     print("[SWITCH] Clicking iTunes icon on taskbar...")
-    loc = locate_element("taskbar_itunes.png", confidence=0.80, region=(750, 845, 200, 55))
-    human_click(*(loc or COORDS_1440x900["taskbar_itunes"]))
+    loc = locate_element("taskbar_itunes.png", confidence=0.80, region=taskbar_region("taskbar_itunes_region"))
+    target = loc or coord("taskbar_itunes")
+    if not target:
+        print("[WARN] Could not find the iTunes icon on the taskbar")
+        return
+    human_click(*target)
     if not wait_for_window("iTunes"):
         print("[WARN] iTunes window did not come to the front")
     human_pause(0.15, 0.3)  # let it repaint
@@ -514,7 +569,9 @@ def click_itunes_submit(fallback_coord):
     """
     for _ in range(3):
         close_notifications()
-        click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=fallback_coord, timeout=3)
+        if not click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=fallback_coord, timeout=3):
+            print("[WARN] Could not find iTunes' Submit button")
+            return False
         if not wait_for_window("Discord", timeout=0.5):
             return True
         print("[WARN] A notification caught the Submit click and opened Discord; going back to iTunes...")
@@ -546,14 +603,16 @@ def run_itunes_reset_cycle(return_to_discord=True):
     else:
         if not wait_for_element("itunes_account_settings_header.png", timeout=1.5, confidence=0.82):
             print("[ITUNES CYCLE] Clicking Account -> View My Account...")
-            click_element("itunes_menu_account.png", fallback_coord=COORDS_1440x900["itunes_menu_account"])
+            click_element("itunes_menu_account.png", fallback_coord=coord("itunes_menu_account"))
             if not click_element("itunes_menu_view_account.png", timeout=4):
                 # Fallback: View My Account is ~70px below Account menu
-                human_click(COORDS_1440x900["itunes_menu_account"][0] + 20, COORDS_1440x900["itunes_menu_account"][1] + 72)
+                account = coord("itunes_menu_account")
+                if account:
+                    human_click(account[0] + 20, account[1] + 72)
 
         if wait_for_element("itunes_manage_payments_link.png", timeout=10):
             print("[ITUNES CYCLE] Clicking Manage Payments...")
-            click_element("itunes_manage_payments_link.png", fallback_coord=COORDS_1440x900["itunes_manage_payments"])
+            click_element("itunes_manage_payments_link.png", fallback_coord=coord("itunes_manage_payments"))
 
         # Manage Payments shows either the existing list ("Add Payment") or the payment-type picker
         page = wait_for_any([("itunes_add_payment_btn.png", ADD_PAYMENT_CONFIDENCE), ("itunes_mobile_carrier_icon.png", CONFIDENCE)], timeout=10)
@@ -564,7 +623,7 @@ def run_itunes_reset_cycle(return_to_discord=True):
     # Select Mobile Carrier icon, then wait for the phone form to load
     if wait_for_element("itunes_mobile_carrier_icon.png", timeout=10):
         print("[ITUNES CYCLE] Selecting Mobile Carrier icon...")
-        click_element("itunes_mobile_carrier_icon.png", fallback_coord=COORDS_1440x900["itunes_mobile_carrier"])
+        click_element("itunes_mobile_carrier_icon.png", fallback_coord=coord("itunes_mobile_carrier"))
         wait_for_element("itunes_phone_input.png", timeout=8, confidence=0.80)
     else:
         print("[WARN] Mobile Carrier option did not show up")
@@ -778,15 +837,16 @@ def process_ticket():
 
     # Click inside the +33 phone number field and paste as-is
     phone_loc = wait_for_element("itunes_phone_input.png", timeout=8, confidence=0.80)
-    if phone_loc:
-        human_click(phone_loc.x + 80, phone_loc.y)
-    else:
-        human_click(*COORDS_1440x900["itunes_phone_input_box"])
+    phone_field = (phone_loc.x + 80, phone_loc.y) if phone_loc else coord("itunes_phone_input_box")
+    if not phone_field:
+        print("[WARN] Could not find iTunes' phone number field. Leaving this ticket for a human.")
+        return False
+    human_click(*phone_field)
     replace_field_text(phone_number)
 
     # Scroll down and click Submit
     human_scroll(-5)
-    click_itunes_submit(COORDS_1440x900["itunes_submit_phone"])
+    click_itunes_submit(coord("itunes_submit_phone"))
 
     print("[ITUNES] Waiting for iTunes to send the code...")
     result = wait_for_any([
@@ -829,13 +889,14 @@ def process_ticket():
         # Switch to iTunes, enter the code, and click Submit
         switch_to_itunes()
         code_box = wait_for_element("itunes_enter_code_input.png", timeout=4, confidence=0.80)
-        if code_box:
-            human_click(code_box.x + 30, code_box.y)
-        else:
-            human_click(*COORDS_1440x900["itunes_enter_code_box"])
+        code_field = (code_box.x + 30, code_box.y) if code_box else coord("itunes_enter_code_box")
+        if not code_field:
+            print("[WARN] Could not find iTunes' code field. Leaving this ticket for a human.")
+            return False
+        human_click(*code_field)
         replace_field_text(code)
 
-        click_itunes_submit(COORDS_1440x900["itunes_submit_code"])
+        click_itunes_submit(coord("itunes_submit_code"))
 
         print("[ITUNES] Waiting for iTunes to check the code...")
         outcome = wait_for_any([
@@ -852,7 +913,7 @@ def process_ticket():
             if attempt == 1:
                 # 1st wrong code: click "Didn't get a verification code?" in iTunes
                 print("[RETRY] Clicking 'Didn't get a verification code?' in iTunes...")
-                click_element("itunes_didnt_get_code_link.png", confidence=0.80, fallback_coord=COORDS_1440x900["itunes_didnt_get_code"], timeout=4)
+                click_element("itunes_didnt_get_code_link.png", confidence=0.80, fallback_coord=coord("itunes_didnt_get_code"), timeout=4)
 
                 # After a code was submitted the ticket only offers Resend Code inside the Action menu
                 switch_to_discord()
@@ -908,11 +969,50 @@ def process_ticket():
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
+def _cli_args():
+    return [arg.strip() for arg in sys.argv[1:]]
+
+
+def ask_resolution():
+    """Which images/<resolution> folder to use: `python bot.py 1920x1080`, or asked at startup."""
+    names = list(PROFILES)
+    for arg in _cli_args():
+        if arg in PROFILES:
+            return arg
+    detected = "%dx%d" % screen_size()
+    default = detected if detected in PROFILES else BASE_PROFILE
+    print("Screen resolution:")
+    for i, name in enumerate(names, 1):
+        print(f"  {i}) {name}" + ("   <- this screen" if name == detected else ""))
+    while True:
+        try:
+            answer = input(f"Choose 1-{len(names)} (Enter = {default}): ").strip()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        if answer in PROFILES:
+            return answer
+        print(f"Please type a number from 1 to {len(names)}, or just press Enter.")
+
+
+def describe_profile():
+    own_dir = os.path.join(IMAGES_ROOT, profile_name)
+    own = [f for f in os.listdir(own_dir) if f.endswith(".png")] if os.path.isdir(own_dir) else []
+    note = "" if profile_name == BASE_PROFILE else f", the rest borrowed from {BASE_PROFILE}"
+    print(f"[SETUP] Resolution {profile_name}: {len(own)} image(s) of its own{note}.")
+    detected = "%dx%d" % screen_size()
+    if detected != profile_name:
+        print(f"[WARN] This screen is {detected}, not {profile_name}; images and click spots may not line up.")
+
+
 def ask_verification_limit():
     """How many verifications to do before stopping: `python bot.py 2`, or asked at startup. None = no limit."""
-    if len(sys.argv) > 1:
-        answer = sys.argv[1].strip()
-        return int(answer) if answer.isdigit() and int(answer) > 0 else None
+    for answer in _cli_args():
+        if answer.isdigit():
+            return int(answer) if int(answer) > 0 else None
     while True:
         try:
             answer = input("How many verifications before the bot stops? (1, 2, 3 ... or press Enter for no limit): ").strip()
@@ -940,9 +1040,11 @@ def send_done_message():
 def main():
     global last_itunes_cycle_time
     print("==================================================================")
-    print("  DISCORD <-> ITUNES VISUAL AUTOMATION BOT (1440x900 @ 100%)")
+    print("  DISCORD <-> ITUNES VISUAL AUTOMATION BOT (display scaling 100%)")
     print("  Safety Abort: Slam mouse into ANY of the 4 screen corners.")
     print("==================================================================")
+    select_profile(ask_resolution())
+    describe_profile()
     limit = ask_verification_limit()
     print(f"[SETUP] Will stop after {limit} verification(s)." if limit else "[SETUP] No limit - runs until you close it.")
     print("Starting in 3 seconds...")
