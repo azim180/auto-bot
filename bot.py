@@ -11,13 +11,18 @@ import cv2
 import numpy as np
 import pyautogui
 
+try:
+    import pyperclip  # installed with pyautogui; talks to the Windows clipboard directly
+except ImportError:
+    pyperclip = None
+
 Point = collections.namedtuple("Point", "x y")
 
 # ==============================================================================
 # CONFIGURATION (1440 x 900 Resolution @ 100% Scale)
 # ==============================================================================
 pyautogui.FAILSAFE = True   # Slam mouse into any of the 4 screen corners to abort
-pyautogui.PAUSE = 0.05      # Base pause; the human_* helpers add small randomized waits on top
+pyautogui.PAUSE = 0.03      # Base pause; the human_* helpers add small randomized waits on top
 
 IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
 CONFIDENCE = 0.84
@@ -30,7 +35,7 @@ KEEP_ALIVE_INTERVAL = 600
 CODE_WAIT_TIMEOUT = 120
 
 # Fallback "the embed finished updating" rule: unchanged for this long
-EMBED_SETTLE_SECONDS = 0.5
+EMBED_SETTLE_SECONDS = 0.35
 # Longest wait for Discord to react to a button click
 EMBED_UPDATE_TIMEOUT = 8
 
@@ -78,7 +83,12 @@ def get_active_window_title():
 
 
 def get_clipboard_text():
-    """Reads current text from the Windows clipboard using built-in tkinter."""
+    """Reads current text from the Windows clipboard."""
+    if pyperclip:
+        try:
+            return pyperclip.paste() or ""
+        except Exception:
+            pass
     try:
         r = tk.Tk()
         r.withdraw()
@@ -90,7 +100,13 @@ def get_clipboard_text():
 
 
 def set_clipboard_text(text):
-    """Writes text directly to the Windows clipboard."""
+    """Writes text directly to the Windows clipboard ("" empties it)."""
+    if pyperclip:
+        try:
+            pyperclip.copy(text)
+            return
+        except Exception:
+            pass
     try:
         r = tk.Tk()
         r.withdraw()
@@ -144,12 +160,23 @@ def _load_template(image_name):
     return _templates[image_name]
 
 
-def _match_scores(image_name, region=None):
+def grab_screen():
+    """One full screenshot that several locate_element(..., screen=...) calls can share."""
+    try:
+        return pyautogui.screenshot()
+    except Exception:
+        return None
+
+
+def _match_scores(image_name, region=None, screen=None):
     """Template-matches an image against the screen (or `region`): (scores, x0, y0, w, h) or None."""
     template = _load_template(image_name)
     if template is None:
         return None
-    shot = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
+    if screen is not None:
+        shot = screen.crop((region[0], region[1], region[0] + region[2], region[1] + region[3])) if region else screen
+    else:
+        shot = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
     haystack = cv2.cvtColor(np.array(shot.convert("RGB")), cv2.COLOR_RGB2BGR)
     h, w = template.shape[:2]
     if haystack.shape[0] < h or haystack.shape[1] < w:
@@ -159,10 +186,10 @@ def _match_scores(image_name, region=None):
     return scores, x0, y0, w, h
 
 
-def locate_box(image_name, confidence=CONFIDENCE, region=None):
+def locate_box(image_name, confidence=CONFIDENCE, region=None, screen=None):
     """(left, top, width, height) of the best match on screen, or None below `confidence`."""
     try:
-        found = _match_scores(image_name, region)
+        found = _match_scores(image_name, region, screen)
     except Exception:
         return None
     if found is None:
@@ -174,7 +201,7 @@ def locate_box(image_name, confidence=CONFIDENCE, region=None):
     return (x0 + int(x), y0 + int(y), w, h)
 
 
-def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False):
+def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False, screen=None):
     """
     Finds an image on screen and returns the center of the BEST match. (pyautogui returns the
     first match above `confidence` in reading order, so a lookalike higher up the screen - like
@@ -182,10 +209,10 @@ def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=F
     If pick_bottom=True, picks the lowest match instead (newest Discord message).
     """
     if not pick_bottom:
-        box = locate_box(image_name, confidence=confidence, region=region)
+        box = locate_box(image_name, confidence=confidence, region=region, screen=screen)
         return Point(box[0] + box[2] // 2, box[1] + box[3] // 2) if box else None
     try:
-        found = _match_scores(image_name, region)
+        found = _match_scores(image_name, region, screen)
     except Exception:
         return None
     if found is None:
@@ -208,7 +235,7 @@ def wait_for_element(image_name, timeout=10, confidence=CONFIDENCE, pick_bottom=
         loc = locate_element(image_name, confidence=confidence, region=region, pick_bottom=pick_bottom)
         if loc:
             return loc
-        time.sleep(0.2)
+        time.sleep(0.1)
     return None
 
 
@@ -216,17 +243,18 @@ def wait_for_any(candidates, timeout=15):
     """Waits for the first of several (image, confidence) pairs to appear; returns its image name."""
     start = time.time()
     while time.time() - start < timeout:
+        screen = grab_screen()
         for image_name, confidence in candidates:
-            if locate_element(image_name, confidence=confidence):
+            if locate_element(image_name, confidence=confidence, screen=screen):
                 return image_name
-        time.sleep(0.25)
+        time.sleep(0.1)
     return None
 
 
 # ==============================================================================
 # HUMAN-LIKE INPUT
 # ==============================================================================
-def human_pause(low=0.1, high=0.25):
+def human_pause(low=0.06, high=0.15):
     time.sleep(random.uniform(low, high))
 
 
@@ -239,31 +267,31 @@ def human_move(x, y, jitter=2):
         distance = math.hypot(tx - cx, ty - cy)
     except Exception:
         distance = 500
-    duration = min(0.5, 0.12 + distance / 2500) * random.uniform(0.9, 1.15)
+    duration = min(0.35, 0.08 + distance / 4000) * random.uniform(0.9, 1.1)
     pyautogui.moveTo(tx, ty, duration=duration, tween=pyautogui.easeOutQuad)
-    human_pause(0.04, 0.1)
+    human_pause(0.02, 0.06)
 
 
 def human_click(x, y, clicks=1, jitter=2):
     human_move(x, y, jitter=jitter)
-    pyautogui.click(clicks=clicks, interval=random.uniform(0.07, 0.11))
-    human_pause(0.08, 0.18)
+    pyautogui.click(clicks=clicks, interval=random.uniform(0.06, 0.09))
+    human_pause(0.05, 0.12)
 
 
 def human_hotkey(*keys):
-    pyautogui.hotkey(*keys, interval=random.uniform(0.03, 0.06))
-    human_pause(0.06, 0.14)
+    pyautogui.hotkey(*keys, interval=random.uniform(0.02, 0.04))
+    human_pause(0.04, 0.09)
 
 
 def human_press(key):
     pyautogui.press(key)
-    human_pause(0.05, 0.12)
+    human_pause(0.03, 0.08)
 
 
 def human_type(text):
     for ch in text:
         pyautogui.write(ch)
-        time.sleep(random.uniform(0.03, 0.09))
+        time.sleep(random.uniform(0.03, 0.07))
 
 
 def human_scroll(notches):
@@ -271,8 +299,8 @@ def human_scroll(notches):
     step = -120 if notches < 0 else 120
     for _ in range(abs(notches)):
         pyautogui.scroll(step)
-        time.sleep(random.uniform(0.03, 0.07))
-    human_pause(0.2, 0.35)
+        time.sleep(random.uniform(0.02, 0.04))
+    human_pause(0.12, 0.22)
 
 
 def click_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False, fallback_coord=None, timeout=0):
@@ -297,7 +325,7 @@ def replace_field_text(text):
     human_press("backspace")
     set_clipboard_text(text)
     human_hotkey("ctrl", "v")
-    human_pause(0.15, 0.3)
+    human_pause(0.08, 0.15)
 
 
 def copy_selection(timeout=1.5):
@@ -308,7 +336,7 @@ def copy_selection(timeout=1.5):
         text = get_clipboard_text().strip()
         if text:
             return text
-        time.sleep(0.08)
+        time.sleep(0.05)
     return ""
 
 
@@ -351,7 +379,7 @@ def click_and_wait_for_update(x, y, what, region=None):
     region = region or screen_area_around(x, y)
     human_move(x, y)
     # Let the hover highlight finish so it is not mistaken for Discord's reply
-    wait_for_screen_settle(region, settle=0.15, timeout=0.8, interval=0.05)
+    wait_for_screen_settle(region, settle=0.1, timeout=0.6, interval=0.04)
     before = _grab(region)
     pyautogui.click()
     if not wait_for_screen_change(region, before):
@@ -373,9 +401,9 @@ def wait_for_claim_to_register(claim_loc, timeout=EMBED_UPDATE_TIMEOUT):
             reject = locate_element("discord_reject_btn.png", confidence=0.82, region=area)
             if reject:
                 # The new buttons are in; give the embed text a moment to finish drawing
-                wait_for_screen_settle(screen_area_around(reject.x, reject.y), settle=0.25, timeout=1.5, interval=0.08)
+                wait_for_screen_settle(screen_area_around(reject.x, reject.y), settle=0.15, timeout=1.2, interval=0.05)
                 return reject
-        time.sleep(0.1)
+        time.sleep(0.08)
     # The hovered Claim button can fall under the strict threshold, so double-check loosely
     if locate_element("discord_claim_btn.png", confidence=0.70, region=area):
         return None
@@ -391,7 +419,7 @@ def wait_for_window(name, timeout=4):
     while time.time() - start < timeout:
         if name in get_active_window_title():
             return True
-        time.sleep(0.1)
+        time.sleep(0.05)
     return False
 
 
@@ -406,7 +434,7 @@ def switch_to_discord():
     human_click(*(loc or COORDS_1440x900["taskbar_discord_right"]))
     if not wait_for_window("Discord"):
         print("[WARN] Discord window did not come to the front")
-    human_pause(0.25, 0.45)  # let it repaint
+    human_pause(0.12, 0.25)  # let it repaint
 
 
 def switch_to_itunes():
@@ -419,10 +447,10 @@ def switch_to_itunes():
     human_click(*(loc or COORDS_1440x900["taskbar_itunes"]))
     if not wait_for_window("iTunes"):
         print("[WARN] iTunes window did not come to the front")
-    human_pause(0.3, 0.5)  # let it repaint
+    human_pause(0.15, 0.3)  # let it repaint
 
 
-def open_ticket_from_notification():
+def open_ticket_from_notification(screen=None):
     """Clicks a new-ticket Windows notification to jump to its channel. True if a Claim button shows up."""
     try:
         screen_w, screen_h = pyautogui.size()
@@ -430,7 +458,7 @@ def open_ticket_from_notification():
         screen_w, screen_h = 1440, 900
     toast_area = (screen_w // 2, screen_h // 2, screen_w - screen_w // 2, screen_h - screen_h // 2)
     for image_name in ("notif_new_ticket_blue.png", "notif_new_ticket_purple.png"):
-        loc = locate_element(image_name, confidence=0.80, region=toast_area)
+        loc = locate_element(image_name, confidence=0.80, region=toast_area, screen=screen)
         if not loc:
             continue
         print("[NOTIFY] New ticket notification - opening its channel...")
@@ -523,10 +551,11 @@ def find_value_box(label):
     return None
 
 
-def copy_ticket_value(label_img, region, extract, default_offsets):
+def copy_ticket_value(label_img, region, extract, default_offsets, require_box=False):
     """
     Finds `Number →` / `Code →` inside `region` (the ticket being handled), double-clicks
-    the value in its box and copies it.
+    the value in its box and copies it. With `require_box`, nothing is clicked unless the
+    value's grey code box is there (after a resend the Code shows a "17 seconds ago" timer).
     Returns the cleaned value, or "" if nothing valid could be copied.
     """
     copied = ""
@@ -535,7 +564,11 @@ def copy_ticket_value(label_img, region, extract, default_offsets):
         if not label:
             print(f"[WARN] Could not find {label_img} on the ticket")
             return ""
-        box = find_value_box(label) or (label.x + default_offsets[0], label.x + default_offsets[1])
+        box = find_value_box(label)
+        if box is None:
+            if require_box:
+                return ""
+            box = (label.x + default_offsets[0], label.x + default_offsets[1])
         left, right, y = box[0], box[1], label.y
 
         set_clipboard_text("")
@@ -546,7 +579,7 @@ def copy_ticket_value(label_img, region, extract, default_offsets):
             return value
 
         print(f"[WARN] Copied {copied!r}, which is not a valid value (try {attempt}/2)")
-        human_pause(0.2, 0.4)
+        human_pause(0.1, 0.2)
     return ""
 
 
@@ -584,11 +617,12 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=None):
     """
     print(f"[WAIT] Waiting up to {timeout}s for user to submit verification code...")
     start = time.time()
-    told_old_code = False
+    told_old_code = told_no_box = False
 
     while time.time() - start < timeout:
+        screen = grab_screen()
         # 1. Check if Windows notification popped up showing "Submitted code:"
-        if locate_element("notif_code_submitted.png", confidence=0.80):
+        if locate_element("notif_code_submitted.png", confidence=0.80, screen=screen):
             print("[DETECTED] Code submission notification seen!")
             switch_to_discord()
 
@@ -597,12 +631,16 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=None):
             switch_to_discord()
 
         # When a user submits a code, the green "Mark as Verified" button appears on the embed
-        mark_loc = locate_element("discord_mark_verified_btn.png", confidence=0.82, pick_bottom=True)
+        mark_loc = locate_element("discord_mark_verified_btn.png", confidence=0.82, pick_bottom=True, screen=screen)
         if mark_loc:
-            wait_for_screen_settle(screen_area_around(mark_loc.x, mark_loc.y), settle=0.3, timeout=2, interval=0.08)
+            wait_for_screen_settle(screen_area_around(mark_loc.x, mark_loc.y), settle=0.2, timeout=2, interval=0.05)
             # Only read the Code from the ticket this button belongs to
             code_region = screen_area_around(mark_loc.x, mark_loc.y, left=200, up=160, right=250, down=0)
-            code = copy_ticket_value("discord_code_label.png", code_region, extract_code, CODE_BOX_OFFSETS)
+            code = copy_ticket_value("discord_code_label.png", code_region, extract_code, CODE_BOX_OFFSETS,
+                                     require_box=True)
+            if not code and not told_no_box:
+                print("[WAIT] Code is not in its box yet (timer showing); waiting for the 4-digit code...")
+                told_no_box = True
             if code and code == previous_code:
                 if not told_old_code:
                     print(f"[WAIT] Ticket still shows the old code {code}; waiting for the new one...")
@@ -613,7 +651,7 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=None):
                 print(f"[CODE COPIED] Extracted verification code: {code}")
                 return code
 
-        time.sleep(0.4)
+        time.sleep(0.2)
 
     print("[TIMEOUT] 2 minutes elapsed without a valid code submission.")
     return None
@@ -648,7 +686,7 @@ def process_ticket():
         return False
 
     # A freshly posted ticket may still be drawing; wait until it is still, then find Claim again
-    wait_for_screen_settle(screen_area_around(claim_loc.x, claim_loc.y), settle=0.3, timeout=2, interval=0.08)
+    wait_for_screen_settle(screen_area_around(claim_loc.x, claim_loc.y), settle=0.2, timeout=2, interval=0.05)
     claim_loc = locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True)
     if not claim_loc:
         return False
@@ -871,10 +909,12 @@ def main():
             run_itunes_reset_cycle(return_to_discord=True)
 
         # 2. A new-ticket notification takes the bot straight to that ticket's channel
-        open_ticket_from_notification()
+        screen = grab_screen()
+        if open_ticket_from_notification(screen):
+            screen = None
 
         # 3. Claim and handle the newest ticket on screen
-        if locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True):
+        if locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True, screen=screen):
             if process_ticket():
                 verified += 1
                 print(f"[COMPLETE] Verified {verified}" + (f"/{limit}" if limit else "") + ".")
@@ -886,7 +926,7 @@ def main():
                 run_itunes_reset_cycle(return_to_discord=True)
             print("[WAIT] Ticket finished. Watching Discord for the next ticket...")
 
-        human_pause(0.3, 0.6)
+        human_pause(0.15, 0.3)
 
 
 if __name__ == "__main__":
