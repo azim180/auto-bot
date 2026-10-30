@@ -45,6 +45,10 @@ VALUE_BOX_RGB = (40, 41, 57)
 NUMBER_BOX_OFFSETS = (38, 110)
 CODE_BOX_OFFSETS = (31, 56)
 
+# Where a Windows notification's X is, from the center of its "⋯ ✕" image or its Discord header
+NOTIF_CLOSE_FROM_DOTS = (20, 0)
+NOTIF_CLOSE_FROM_HEADER = (288, 0)
+
 # Exact 1440x900 fallback coordinates (used if an element is slightly faded)
 COORDS_1440x900 = {
     "taskbar_discord_right": (561, 878),
@@ -450,13 +454,18 @@ def switch_to_itunes():
     human_pause(0.15, 0.3)  # let it repaint
 
 
-def open_ticket_from_notification(screen=None):
-    """Clicks a new-ticket Windows notification to jump to its channel. True if a Claim button shows up."""
+def notification_area():
+    """Bottom-right quarter of the screen, where Windows notifications pop up and stack."""
     try:
         screen_w, screen_h = pyautogui.size()
     except Exception:
         screen_w, screen_h = 1440, 900
-    toast_area = (screen_w // 2, screen_h // 2, screen_w - screen_w // 2, screen_h - screen_h // 2)
+    return (screen_w // 2, screen_h // 2, screen_w - screen_w // 2, screen_h - screen_h // 2)
+
+
+def open_ticket_from_notification(screen=None):
+    """Clicks a new-ticket Windows notification to jump to its channel. True if a Claim button shows up."""
+    toast_area = notification_area()
     for image_name in ("notif_new_ticket_blue.png", "notif_new_ticket_purple.png"):
         loc = locate_element(image_name, confidence=0.80, region=toast_area, screen=screen)
         if not loc:
@@ -468,6 +477,48 @@ def open_ticket_from_notification(screen=None):
             return True
         print("[NOTIFY] Channel opened but no Claim button showed up")
         return False
+    return False
+
+
+def close_notifications(max_rounds=5):
+    """
+    Closes Windows notifications in the bottom-right corner by their X, again while new ones
+    keep popping up. Returns how many were closed.
+    """
+    area = notification_area()
+    closed = 0
+    for _ in range(max_rounds):
+        screen = grab_screen()
+        loc = locate_element("notif_close_btn.png", confidence=0.80, region=area, screen=screen)
+        if loc:
+            target = (loc.x + NOTIF_CLOSE_FROM_DOTS[0], loc.y + NOTIF_CLOSE_FROM_DOTS[1])
+        else:
+            # The X may only show on hover; it always sits at the same spot on the toast's top row
+            header = locate_element("notif_discord_header.png", confidence=0.80, region=area, screen=screen)
+            if not header:
+                break
+            target = (header.x + NOTIF_CLOSE_FROM_HEADER[0], header.y + NOTIF_CLOSE_FROM_HEADER[1])
+        human_click(*target, jitter=1)
+        closed += 1
+        human_pause(0.3, 0.45)  # let it slide away before looking again
+    if closed:
+        print(f"[NOTIFY] Closed {closed} notification(s) that could cover iTunes")
+    return closed
+
+
+def click_itunes_submit(fallback_coord):
+    """
+    Clicks iTunes' Submit. A Windows notification can pop up right over it, so notifications are
+    closed first; if one still caught the click (that brings Discord to the front), go back to
+    iTunes and try again.
+    """
+    for _ in range(3):
+        close_notifications()
+        click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=fallback_coord, timeout=3)
+        if not wait_for_window("Discord", timeout=0.5):
+            return True
+        print("[WARN] A notification caught the Submit click and opened Discord; going back to iTunes...")
+        switch_to_itunes()
     return False
 
 
@@ -735,7 +786,7 @@ def process_ticket():
 
     # Scroll down and click Submit
     human_scroll(-5)
-    click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=COORDS_1440x900["itunes_submit_phone"], timeout=3)
+    click_itunes_submit(COORDS_1440x900["itunes_submit_phone"])
 
     print("[ITUNES] Waiting for iTunes to send the code...")
     result = wait_for_any([
@@ -784,7 +835,7 @@ def process_ticket():
             human_click(*COORDS_1440x900["itunes_enter_code_box"])
         replace_field_text(code)
 
-        click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=COORDS_1440x900["itunes_submit_code"], timeout=3)
+        click_itunes_submit(COORDS_1440x900["itunes_submit_code"])
 
         print("[ITUNES] Waiting for iTunes to check the code...")
         outcome = wait_for_any([
