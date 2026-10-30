@@ -525,5 +525,74 @@ class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
             self.assertEqual(bot.wait_for_user_code(timeout=5, previous_code="1122"), "1246")
 
 
+@unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
+class TestCloseNotifications(unittest.TestCase):
+    """Notifications covering iTunes' Submit are closed by their X, also when they keep coming."""
+
+    def _run(self, frames):
+        from unittest import mock
+        frames, clicks = list(frames), []
+        last = frames[-1]
+        with mock.patch.object(bot, "grab_screen", lambda: frames.pop(0) if frames else last), \
+             mock.patch.object(bot, "human_click", lambda x, y, **k: clicks.append((x, y))), \
+             mock.patch.object(bot, "human_pause", lambda *a, **k: None), \
+             mock.patch("builtins.print"):
+            closed = bot.close_notifications()
+        return closed, clicks
+
+    def _screen(self, *placements):
+        from PIL import Image
+        screen = Image.new("RGB", (1440, 900), (43, 43, 43))
+        for name, xy in placements:
+            screen.paste(Image.open(bot.img_path(name)).convert("RGB"), xy)
+        return screen
+
+    def test_clicks_the_x_of_a_notification(self):
+        from PIL import Image
+        dots = Image.open(bot.img_path("notif_close_btn.png"))
+        closed, clicks = self._run([self._screen(("notif_close_btn.png", (1346, 688))), self._screen()])
+        self.assertEqual(closed, 1)
+        self.assertEqual(clicks, [(1346 + dots.width // 2 + 20, 688 + dots.height // 2)])
+
+    def test_uses_the_header_when_the_x_is_hidden(self):
+        from PIL import Image
+        header = Image.open(bot.img_path("notif_discord_header.png"))
+        closed, clicks = self._run([self._screen(("notif_discord_header.png", (1072, 687))), self._screen()])
+        self.assertEqual(closed, 1)
+        self.assertEqual(clicks, [(1072 + header.width // 2 + 288, 687 + header.height // 2)])
+
+    def test_keeps_closing_while_new_ones_pop_up(self):
+        two = self._screen(("notif_close_btn.png", (1346, 688)), ("notif_close_btn.png", (1346, 500)))
+        one = self._screen(("notif_close_btn.png", (1346, 500)))
+        closed, clicks = self._run([two, one, self._screen()])
+        self.assertEqual(closed, 2)
+
+    def test_nothing_to_close(self):
+        self.assertEqual(self._run([self._screen()]), (0, []))
+
+
+class TestClickItunesSubmit(unittest.TestCase):
+    def test_goes_back_to_itunes_when_a_notification_caught_the_click(self):
+        from unittest import mock
+        calls = []
+        discord_in_front = [True, False]  # 1st click hit a notification, 2nd reached Submit
+        with mock.patch.object(bot, "close_notifications", lambda: calls.append("close")), \
+             mock.patch.object(bot, "click_element", lambda name, **k: calls.append("submit")), \
+             mock.patch.object(bot, "wait_for_window", lambda name, timeout=4: discord_in_front.pop(0)), \
+             mock.patch.object(bot, "switch_to_itunes", lambda: calls.append("back to iTunes")), \
+             mock.patch("builtins.print"):
+            self.assertTrue(bot.click_itunes_submit((1207, 737)))
+        self.assertEqual(calls, ["close", "submit", "back to iTunes", "close", "submit"])
+
+    def test_single_click_when_nothing_gets_in_the_way(self):
+        from unittest import mock
+        calls = []
+        with mock.patch.object(bot, "close_notifications", lambda: calls.append("close")), \
+             mock.patch.object(bot, "click_element", lambda name, **k: calls.append("submit")), \
+             mock.patch.object(bot, "wait_for_window", lambda name, timeout=4: False):
+            self.assertTrue(bot.click_itunes_submit((1207, 737)))
+        self.assertEqual(calls, ["close", "submit"])
+
+
 if __name__ == "__main__":
     unittest.main()
