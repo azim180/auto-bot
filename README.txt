@@ -6,13 +6,15 @@ INCLUDED IN THIS FOLDER:
 1. bot.py                   - Complete visual automation bot script
 2. images/1440x900/         - Cropped visual cue images for a 1440 x 900 screen
 3. images/1920x1080/        - Images for a 1920 x 1080 screen (see its README)
-4. install_requirements.bat - One-click installer for OpenCV & Pillow
+4. install_requirements.bat - One-click installer (Python if missing + all packages)
 5. start_bot.bat            - One-click launcher for the bot
+6. find_python.bat          - Finds Python for the other .bat files
 
 HOW TO RUN:
 1. Extract this entire ZIP folder anywhere on your PC.
-2. Double-click "install_requirements.bat" once to make sure opencv-python
-   and pillow are installed alongside pyautogui.
+2. Double-click "install_requirements.bat" once. It finds Python even when it
+   is not on PATH (or installs Python 3.12 with winget if there is none),
+   installs every package, and checks they all load before saying it's done.
 3. Open Discord (the right Discord icon on your taskbar, inside #code-farm)
    and open iTunes in the background.
 4. Double-click "start_bot.bat" (or run `python bot.py` in terminal).

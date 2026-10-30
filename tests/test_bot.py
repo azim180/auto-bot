@@ -683,5 +683,32 @@ class TestAskResolution(unittest.TestCase):
                 self.assertEqual(bot.ask_resolution(), "1440x900")
 
 
+class TestBatchScripts(unittest.TestCase):
+    """The .bat launchers must work on PCs where pip/python are not on PATH."""
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, name):
+        with open(os.path.join(self.ROOT, name), "rb") as f:
+            return f.read()
+
+    def test_launchers_find_python_first_and_never_call_bare_pip_or_python(self):
+        import re
+        for name in ("install_requirements.bat", "start_bot.bat", "auto-pull.bat"):
+            text = self._read(name).decode("ascii")
+            self.assertIn('call "%~dp0find_python.bat"', text, name)
+            for line in text.splitlines():
+                self.assertIsNone(re.match(r"\s*(pip|python)\s", line, re.I), f"{name}: {line!r}")
+
+    def test_installer_reports_failure_instead_of_success(self):
+        text = self._read("install_requirements.bat").decode("ascii")
+        self.assertIn("-m pip install -r requirements.txt\r\nif errorlevel 1 goto :failed", text)
+        self.assertLess(text.index("goto :failed"), text.index("All packages installed!"))
+
+    def test_batch_files_use_windows_line_endings(self):
+        for name in ("find_python.bat", "install_requirements.bat", "start_bot.bat", "auto-pull.bat"):
+            data = self._read(name)
+            self.assertEqual(data.count(b"\n"), data.count(b"\r\n"), f"{name} has Unix line endings")
+
+
 if __name__ == "__main__":
     unittest.main()
