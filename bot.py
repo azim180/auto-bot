@@ -12,7 +12,7 @@ import pyautogui
 # CONFIGURATION (1440 x 900 Resolution @ 100% Scale)
 # ==============================================================================
 pyautogui.FAILSAFE = True   # Slam mouse into any of the 4 screen corners to abort
-pyautogui.PAUSE = 0.1       # Base pause; the human_* helpers add randomized waits on top
+pyautogui.PAUSE = 0.05      # Base pause; the human_* helpers add small randomized waits on top
 
 IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
 CONFIDENCE = 0.84
@@ -22,10 +22,16 @@ KEEP_ALIVE_INTERVAL = 600
 # 2-minute timer (120 seconds) waiting for the user's verification code
 CODE_WAIT_TIMEOUT = 120
 
-# A Discord embed counts as fully updated once it has looked the same for this long
-EMBED_SETTLE_SECONDS = 1.2
+# Fallback "the embed finished updating" rule: unchanged for this long
+EMBED_SETTLE_SECONDS = 0.5
 # Longest wait for Discord to react to a button click
-EMBED_UPDATE_TIMEOUT = 10
+EMBED_UPDATE_TIMEOUT = 8
+
+# Inline-code box behind the Number / Code values, and where it sits relative to the
+# label's center when it cannot be detected (measured on the 1440x900 ticket embed)
+VALUE_BOX_RGB = (40, 41, 57)
+NUMBER_BOX_OFFSETS = (38, 110)
+CODE_BOX_OFFSETS = (31, 56)
 
 # Exact 1440x900 fallback coordinates (used if an element is slightly faded)
 COORDS_1440x900 = {
@@ -89,14 +95,27 @@ def set_clipboard_text(text):
         print(f"[WARN] Clipboard write error: {e}")
 
 
-def looks_like_phone(text):
-    if re.search(r"[A-Za-z]", text):
-        return False
-    return 6 <= len(re.sub(r"\D", "", text)) <= 15
+def extract_phone(text):
+    """Returns the phone number found in copied text (spaces kept), or "" if there is none."""
+    for match in re.findall(r"\+?\d[\d \-]*\d", text):
+        if 8 <= len(re.sub(r"\D", "", match)) <= 15:
+            return match.strip()
+    return ""
 
 
-def looks_like_code(text):
-    return re.fullmatch(r"\d{4,8}", text.strip()) is not None
+def extract_code(text):
+    match = re.search(r"(?<!\d)\d{4,8}(?!\d)", text)
+    return match.group(0) if match else ""
+
+
+def screen_area_around(x, y, left=120, up=220, right=260, down=40):
+    try:
+        screen_w, screen_h = pyautogui.size()
+    except Exception:
+        screen_w, screen_h = 1440, 900
+    x0, y0 = max(0, int(x) - left), max(0, int(y) - up)
+    x1, y1 = min(screen_w, int(x) + right), min(screen_h, int(y) + down)
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
 def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False):
@@ -125,7 +144,7 @@ def wait_for_element(image_name, timeout=10, confidence=CONFIDENCE, pick_bottom=
         loc = locate_element(image_name, confidence=confidence, region=region, pick_bottom=pick_bottom)
         if loc:
             return loc
-        time.sleep(0.4)
+        time.sleep(0.2)
     return None
 
 
@@ -136,14 +155,14 @@ def wait_for_any(candidates, timeout=15):
         for image_name, confidence in candidates:
             if locate_element(image_name, confidence=confidence):
                 return image_name
-        time.sleep(0.4)
+        time.sleep(0.25)
     return None
 
 
 # ==============================================================================
 # HUMAN-LIKE INPUT
 # ==============================================================================
-def human_pause(low=0.25, high=0.6):
+def human_pause(low=0.1, high=0.25):
     time.sleep(random.uniform(low, high))
 
 
@@ -156,31 +175,31 @@ def human_move(x, y, jitter=2):
         distance = math.hypot(tx - cx, ty - cy)
     except Exception:
         distance = 500
-    duration = min(0.9, 0.2 + distance / 2000) * random.uniform(0.85, 1.2)
+    duration = min(0.5, 0.12 + distance / 2500) * random.uniform(0.9, 1.15)
     pyautogui.moveTo(tx, ty, duration=duration, tween=pyautogui.easeOutQuad)
-    human_pause(0.08, 0.2)
+    human_pause(0.04, 0.1)
 
 
 def human_click(x, y, clicks=1, jitter=2):
     human_move(x, y, jitter=jitter)
-    pyautogui.click(clicks=clicks, interval=random.uniform(0.08, 0.13))
-    human_pause(0.2, 0.45)
+    pyautogui.click(clicks=clicks, interval=random.uniform(0.07, 0.11))
+    human_pause(0.08, 0.18)
 
 
 def human_hotkey(*keys):
-    pyautogui.hotkey(*keys, interval=random.uniform(0.04, 0.09))
-    human_pause(0.15, 0.35)
+    pyautogui.hotkey(*keys, interval=random.uniform(0.03, 0.06))
+    human_pause(0.06, 0.14)
 
 
 def human_press(key):
     pyautogui.press(key)
-    human_pause(0.12, 0.3)
+    human_pause(0.05, 0.12)
 
 
 def human_type(text):
     for ch in text:
         pyautogui.write(ch)
-        time.sleep(random.uniform(0.05, 0.16))
+        time.sleep(random.uniform(0.03, 0.09))
 
 
 def human_scroll(notches):
@@ -188,8 +207,8 @@ def human_scroll(notches):
     step = -120 if notches < 0 else 120
     for _ in range(abs(notches)):
         pyautogui.scroll(step)
-        time.sleep(random.uniform(0.06, 0.14))
-    human_pause(0.4, 0.8)
+        time.sleep(random.uniform(0.03, 0.07))
+    human_pause(0.2, 0.35)
 
 
 def click_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False, fallback_coord=None, timeout=0):
@@ -209,16 +228,15 @@ def click_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=Fa
 
 
 def replace_field_text(text):
-    """Clears the focused input and pastes `text`, pausing between steps like a person."""
+    """Clears the focused input and pastes `text`."""
     human_hotkey("ctrl", "a")
     human_press("backspace")
     set_clipboard_text(text)
-    human_pause(0.1, 0.25)
     human_hotkey("ctrl", "v")
-    human_pause(0.3, 0.6)
+    human_pause(0.15, 0.3)
 
 
-def copy_selection(timeout=2.0):
+def copy_selection(timeout=1.5):
     """Presses Ctrl+C, then waits for the text to actually land on the clipboard."""
     human_hotkey("ctrl", "c")
     start = time.time()
@@ -226,7 +244,7 @@ def copy_selection(timeout=2.0):
         text = get_clipboard_text().strip()
         if text:
             return text
-        time.sleep(0.15)
+        time.sleep(0.08)
     return ""
 
 
@@ -240,18 +258,7 @@ def _grab(region):
         return None
 
 
-def screen_area_around(x, y, left=120, up=220, right=260, down=40):
-    # Kept tight below the button so the chat box's animated "is typing" dots stay outside it
-    try:
-        screen_w, screen_h = pyautogui.size()
-    except Exception:
-        screen_w, screen_h = 1440, 900
-    x0, y0 = max(0, int(x) - left), max(0, int(y) - up)
-    x1, y1 = min(screen_w, int(x) + right), min(screen_h, int(y) + down)
-    return (x0, y0, x1 - x0, y1 - y0)
-
-
-def wait_for_screen_change(region, before, timeout=EMBED_UPDATE_TIMEOUT, interval=0.25):
+def wait_for_screen_change(region, before, timeout=EMBED_UPDATE_TIMEOUT, interval=0.1):
     start = time.time()
     while time.time() - start < timeout:
         now = _grab(region)
@@ -261,7 +268,7 @@ def wait_for_screen_change(region, before, timeout=EMBED_UPDATE_TIMEOUT, interva
     return False
 
 
-def wait_for_screen_settle(region, settle=EMBED_SETTLE_SECONDS, timeout=EMBED_UPDATE_TIMEOUT, interval=0.25):
+def wait_for_screen_settle(region, settle=EMBED_SETTLE_SECONDS, timeout=EMBED_UPDATE_TIMEOUT, interval=0.1):
     """Waits until `region` has looked the same for `settle` seconds (Discord finished re-rendering)."""
     start = last_change = time.time()
     last = _grab(region)
@@ -280,25 +287,47 @@ def click_and_wait_for_update(x, y, what, region=None):
     region = region or screen_area_around(x, y)
     human_move(x, y)
     # Let the hover highlight finish so it is not mistaken for Discord's reply
-    wait_for_screen_settle(region, settle=0.4, timeout=2, interval=0.1)
+    wait_for_screen_settle(region, settle=0.15, timeout=0.8, interval=0.05)
     before = _grab(region)
     pyautogui.click()
     if not wait_for_screen_change(region, before):
         print(f"[WARN] Discord did not react to {what} within {EMBED_UPDATE_TIMEOUT}s")
     elif not wait_for_screen_settle(region):
         print(f"[WARN] Discord kept changing after {what}; continuing anyway")
-    human_pause(0.3, 0.6)
+
+
+def wait_for_claim_to_register(claim_loc, timeout=EMBED_UPDATE_TIMEOUT):
+    """
+    After clicking Claim: waits until the Claim button is gone and Reject has appeared.
+    Returns Reject's position (the old Claim spot if Reject was never seen),
+    or None if the Claim button never went away.
+    """
+    area = screen_area_around(claim_loc.x, claim_loc.y, left=150, up=80, right=300, down=80)
+    start = time.time()
+    while time.time() - start < timeout:
+        if locate_element("discord_claim_btn.png", confidence=CONFIDENCE, region=area) is None:
+            reject = locate_element("discord_reject_btn.png", confidence=0.82, region=area)
+            if reject:
+                # The new buttons are in; give the embed text a moment to finish drawing
+                wait_for_screen_settle(screen_area_around(reject.x, reject.y), settle=0.25, timeout=1.5, interval=0.08)
+                return reject
+        time.sleep(0.1)
+    # The hovered Claim button can fall under the strict threshold, so double-check loosely
+    if locate_element("discord_claim_btn.png", confidence=0.70, region=area):
+        return None
+    print("[WARN] Claim went through but the Reject button was not seen; continuing")
+    return claim_loc
 
 
 # ==============================================================================
 # WINDOW SWITCHING (Right Discord Icon & iTunes)
 # ==============================================================================
-def wait_for_window(name, timeout=5):
+def wait_for_window(name, timeout=4):
     start = time.time()
     while time.time() - start < timeout:
         if name in get_active_window_title():
             return True
-        time.sleep(0.2)
+        time.sleep(0.1)
     return False
 
 
@@ -313,7 +342,7 @@ def switch_to_discord():
     human_click(*(loc or COORDS_1440x900["taskbar_discord_right"]))
     if not wait_for_window("Discord"):
         print("[WARN] Discord window did not come to the front")
-    human_pause(0.5, 0.9)  # let it repaint
+    human_pause(0.25, 0.45)  # let it repaint
 
 
 def switch_to_itunes():
@@ -326,7 +355,28 @@ def switch_to_itunes():
     human_click(*(loc or COORDS_1440x900["taskbar_itunes"]))
     if not wait_for_window("iTunes"):
         print("[WARN] iTunes window did not come to the front")
-    human_pause(0.6, 1.0)  # let it repaint
+    human_pause(0.3, 0.5)  # let it repaint
+
+
+def open_ticket_from_notification():
+    """Clicks a new-ticket Windows notification to jump to its channel. True if a Claim button shows up."""
+    try:
+        screen_w, screen_h = pyautogui.size()
+    except Exception:
+        screen_w, screen_h = 1440, 900
+    toast_area = (screen_w // 2, screen_h // 2, screen_w - screen_w // 2, screen_h - screen_h // 2)
+    for image_name in ("notif_new_ticket_blue.png", "notif_new_ticket_purple.png"):
+        loc = locate_element(image_name, confidence=0.80, region=toast_area)
+        if not loc:
+            continue
+        print("[NOTIFY] New ticket notification - opening its channel...")
+        human_click(loc.x, loc.y)
+        wait_for_window("Discord")
+        if wait_for_element("discord_claim_btn.png", timeout=6, confidence=CONFIDENCE, pick_bottom=True):
+            return True
+        print("[NOTIFY] Channel opened but no Claim button showed up")
+        return False
+    return False
 
 
 # ==============================================================================
@@ -334,44 +384,47 @@ def switch_to_itunes():
 # ==============================================================================
 def run_itunes_reset_cycle(return_to_discord=True):
     """
-    Navigates iTunes:
-    Account (if not already on Account Settings) -> View My Account -> Manage Payments -> Mobile Carrier icon.
-    Resets the 10-minute keep-alive timer back to 0:00.
+    Navigates iTunes to the Mobile Carrier Add Payment form and resets the 10-minute timer:
+    Manage Payments -> Add Payment directly if it is already open (even with a Mobile Phone listed),
+    otherwise Account -> View My Account -> Manage Payments -> (Add Payment) -> Mobile Carrier icon.
     """
     global last_itunes_cycle_time
     print("[ITUNES CYCLE] Resetting iTunes to Mobile Carrier Add Payment screen...")
     switch_to_itunes()
-    human_pause(0.5, 0.9)
 
     # Dismiss any leftover popup first
     if locate_element("itunes_popup_ok_btn.png", confidence=0.82):
         click_element("itunes_popup_ok_btn.png", confidence=0.82)
-        human_pause(0.6, 1.0)
+        human_pause(0.3, 0.5)
 
-    # Step 2 rule: If not already on Account Settings, click Account -> View My Account...
-    if not wait_for_element("itunes_account_settings_header.png", timeout=2, confidence=0.82):
-        print("[ITUNES CYCLE] Clicking Account -> View My Account...")
-        click_element("itunes_menu_account.png", fallback_coord=COORDS_1440x900["itunes_menu_account"])
-        if not click_element("itunes_menu_view_account.png", timeout=4):
-            # Fallback: View My Account is ~70px below Account menu
-            human_click(COORDS_1440x900["itunes_menu_account"][0] + 20, COORDS_1440x900["itunes_menu_account"][1] + 72)
-
-    # Click Manage Payments once the account page has loaded
-    if wait_for_element("itunes_manage_payments_link.png", timeout=10):
-        print("[ITUNES CYCLE] Clicking Manage Payments...")
-        click_element("itunes_manage_payments_link.png", fallback_coord=COORDS_1440x900["itunes_manage_payments"])
-
-    # Manage Payments shows either the existing list ("Add Payment") or the payment-type picker
-    page = wait_for_any([("itunes_add_payment_btn.png", 0.82), ("itunes_mobile_carrier_icon.png", CONFIDENCE)], timeout=10)
-    if page == "itunes_add_payment_btn.png":
-        print("[ITUNES CYCLE] Clicking Add Payment...")
+    if locate_element("itunes_add_payment_btn.png", confidence=0.82):
+        print("[ITUNES CYCLE] Already on Manage Payments - clicking Add Payment...")
         click_element("itunes_add_payment_btn.png", confidence=0.82)
+    else:
+        if not wait_for_element("itunes_account_settings_header.png", timeout=1.5, confidence=0.82):
+            print("[ITUNES CYCLE] Clicking Account -> View My Account...")
+            click_element("itunes_menu_account.png", fallback_coord=COORDS_1440x900["itunes_menu_account"])
+            if not click_element("itunes_menu_view_account.png", timeout=4):
+                # Fallback: View My Account is ~70px below Account menu
+                human_click(COORDS_1440x900["itunes_menu_account"][0] + 20, COORDS_1440x900["itunes_menu_account"][1] + 72)
+
+        if wait_for_element("itunes_manage_payments_link.png", timeout=10):
+            print("[ITUNES CYCLE] Clicking Manage Payments...")
+            click_element("itunes_manage_payments_link.png", fallback_coord=COORDS_1440x900["itunes_manage_payments"])
+
+        # Manage Payments shows either the existing list ("Add Payment") or the payment-type picker
+        page = wait_for_any([("itunes_add_payment_btn.png", 0.82), ("itunes_mobile_carrier_icon.png", CONFIDENCE)], timeout=10)
+        if page == "itunes_add_payment_btn.png":
+            print("[ITUNES CYCLE] Clicking Add Payment...")
+            click_element("itunes_add_payment_btn.png", confidence=0.82)
 
     # Select Mobile Carrier icon, then wait for the phone form to load
     if wait_for_element("itunes_mobile_carrier_icon.png", timeout=10):
         print("[ITUNES CYCLE] Selecting Mobile Carrier icon...")
         click_element("itunes_mobile_carrier_icon.png", fallback_coord=COORDS_1440x900["itunes_mobile_carrier"])
         wait_for_element("itunes_phone_input.png", timeout=8, confidence=0.80)
+    else:
+        print("[WARN] Mobile Carrier option did not show up")
 
     # Reset the 10-minute timer to 0 because the full cycle just completed!
     last_itunes_cycle_time = time.time()
@@ -384,38 +437,69 @@ def run_itunes_reset_cycle(return_to_discord=True):
 # ==============================================================================
 # DISCORD TEXT EXTRACTION & ACTIONS
 # ==============================================================================
-def copy_value_next_to_label(label_img, x_offset=65, is_valid=bool):
+def find_value_box(label):
+    """Returns (left, right) of the grey inline-code box to the right of a `Label →`, or None."""
+    probe_y = int(label.y) - 5  # top padding row of the box: solid colour, no text
+    x0 = int(label.x)
+    try:
+        raw = pyautogui.screenshot(region=(x0, probe_y, 260, 1)).convert("RGB").tobytes()
+    except Exception:
+        return None
+    br, bg, bb = VALUE_BOX_RGB
+    run_start = None
+    for i in range(len(raw) // 3):
+        r, g, b = raw[3 * i:3 * i + 3]
+        inside = abs(r - br) <= 6 and abs(g - bg) <= 6 and abs(b - bb) <= 8
+        if inside and run_start is None:
+            run_start = i
+        elif not inside and run_start is not None:
+            if i - run_start >= 10:
+                return (x0 + run_start, x0 + i - 1)
+            run_start = None
+    return None
+
+
+def copy_ticket_value(label_img, region, extract, default_offsets, drag_fallback=True):
     """
-    Finds `Number ->` or `Code ->` on the newest ticket embed, double-clicks the value
-    to its right and copies it. Returns "" if nothing valid could be copied.
+    Finds `Number →` / `Code →` inside `region` (the ticket being handled), double-clicks
+    the value in its box and copies it. A spaced phone number only half-selects on a
+    double-click, so `drag_fallback` then drags across the whole box.
+    Returns the cleaned value, or "" if nothing valid could be copied.
     """
-    loc = None
+    copied = ""
     for attempt in (1, 2):
-        loc = wait_for_element(label_img, timeout=8, confidence=0.82, pick_bottom=True)
-        if not loc:
+        label = wait_for_element(label_img, timeout=3, confidence=0.82, pick_bottom=True, region=region)
+        if not label:
             print(f"[WARN] Could not find {label_img} on the ticket")
             return ""
-        set_clipboard_text("")
-        human_click(loc.x + x_offset, loc.y, clicks=2, jitter=1)
-        copied = copy_selection()
-        if is_valid(copied):
-            return copied
-        print(f"[WARN] Double-click copied '{copied}', which is not a valid value (try {attempt}/2)")
-        human_pause(0.6, 1.0)
+        box = find_value_box(label) or (label.x + default_offsets[0], label.x + default_offsets[1])
+        left, right, y = box[0], box[1], label.y
 
-    # Last resort: drag across the value
-    set_clipboard_text("")
-    human_move(loc.x + 38, loc.y, jitter=0)
-    pyautogui.dragTo(loc.x + 145, loc.y, duration=random.uniform(0.35, 0.55), button="left")
-    human_pause(0.15, 0.3)
-    copied = copy_selection()
-    return copied if is_valid(copied) else ""
+        set_clipboard_text("")
+        human_click((left + right) / 2, y, clicks=2, jitter=1)
+        copied = copy_selection()
+        value = extract(copied)
+        if value:
+            return value
+
+        if drag_fallback:
+            set_clipboard_text("")
+            human_move(left - 1, y, jitter=0)
+            pyautogui.dragTo(right + 4, y, duration=random.uniform(0.2, 0.35), button="left")
+            human_pause(0.05, 0.1)
+            copied = copy_selection()
+            value = extract(copied)
+            if value:
+                return value
+
+        print(f"[WARN] Copied '{copied}', which is not a valid value (try {attempt}/2)")
+        human_pause(0.2, 0.4)
+    return ""
 
 
 def select_discord_action_menu_item(menu_item_img):
     """Clicks the Action dropdown on the newest ticket and selects the specified option."""
     switch_to_discord()
-    human_pause(0.3, 0.6)
     print(f"[DISCORD] Opening Action dropdown for {menu_item_img}...")
     action_loc = wait_for_element("discord_action_dropdown.png", timeout=8, confidence=0.80, pick_bottom=True)
     if not action_loc:
@@ -423,7 +507,7 @@ def select_discord_action_menu_item(menu_item_img):
         return False
     human_click(action_loc.x, action_loc.y)
 
-    loc = wait_for_element(menu_item_img, timeout=6, confidence=0.78, pick_bottom=True)
+    loc = wait_for_element(menu_item_img, timeout=5, confidence=0.78, pick_bottom=True)
     if loc:
         click_and_wait_for_update(loc.x, loc.y, menu_item_img, region=screen_area_around(action_loc.x, action_loc.y))
         return True
@@ -452,25 +536,23 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT):
         if locate_element("notif_code_submitted.png", confidence=0.80):
             print("[DETECTED] Code submission notification seen!")
             switch_to_discord()
-            human_pause(0.8, 1.2)
 
         # 2. Periodically check Discord embed directly (every ~4s) so we never miss a code
         if int(time.time() - start) % 4 == 0:
             switch_to_discord()
-            human_pause(0.4, 0.8)
 
         # When a user submits a code, the green "Mark as Verified" button appears on the embed
         mark_loc = locate_element("discord_mark_verified_btn.png", confidence=0.82, pick_bottom=True)
         if mark_loc:
-            # Let the embed finish updating before reading the code from it
-            wait_for_screen_settle(screen_area_around(mark_loc.x, mark_loc.y))
-            raw_code = copy_value_next_to_label("discord_code_label.png", x_offset=55, is_valid=looks_like_code)
-            if raw_code:
-                digits = re.sub(r"\D", "", raw_code)
-                print(f"[CODE COPIED] Extracted verification code: {digits}")
-                return digits
+            wait_for_screen_settle(screen_area_around(mark_loc.x, mark_loc.y), settle=0.3, timeout=2, interval=0.08)
+            # Only read the Code from the ticket this button belongs to
+            code_region = screen_area_around(mark_loc.x, mark_loc.y, left=200, up=160, right=250, down=0)
+            code = copy_ticket_value("discord_code_label.png", code_region, extract_code, CODE_BOX_OFFSETS, drag_fallback=False)
+            if code:
+                print(f"[CODE COPIED] Extracted verification code: {code}")
+                return code
 
-        time.sleep(1.0)
+        time.sleep(0.4)
 
     print("[TIMEOUT] 2 minutes elapsed without a valid code submission.")
     return None
@@ -499,17 +581,16 @@ def has_returning_user_warning(embed_region):
 # MAIN TICKET WORKFLOW
 # ==============================================================================
 def process_ticket():
-    """Handles a single Discord verification ticket from Claim to completion."""
+    """Handles a single Discord verification ticket from Claim to completion. True when verified."""
     switch_to_discord()
-    human_pause(0.3, 0.6)
 
-    claim_loc = locate_element("discord_claim_btn.png", confidence=0.84, pick_bottom=True)
+    claim_loc = locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True)
     if not claim_loc:
         return False
 
-    # Let a freshly posted ticket finish rendering, then find its Claim button again
-    wait_for_screen_settle(screen_area_around(claim_loc.x, claim_loc.y), timeout=5)
-    claim_loc = locate_element("discord_claim_btn.png", confidence=0.84, pick_bottom=True)
+    # A freshly posted ticket may still be drawing; wait until it is still, then find Claim again
+    wait_for_screen_settle(screen_area_around(claim_loc.x, claim_loc.y), settle=0.3, timeout=2, interval=0.08)
+    claim_loc = locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True)
     if not claim_loc:
         return False
 
@@ -517,9 +598,14 @@ def process_ticket():
     embed_region = (max(0, int(claim_loc.x - 120)), max(0, int(claim_loc.y - 160)), 350, 160)
     is_returning_user = has_returning_user_warning(embed_region)
 
-    # Click Claim and wait for Discord to finish updating the embed
+    # Click Claim, then wait until the embed shows Claim -> @you and the Resend Code / Reject buttons
     print("[TICKET] Clicking Claim button...")
-    click_and_wait_for_update(claim_loc.x, claim_loc.y, "Claim")
+    human_click(claim_loc.x, claim_loc.y)
+    anchor = wait_for_claim_to_register(claim_loc)
+    if anchor is None:
+        print("[WARN] Claim did not go through (Claim button still there). Skipping this ticket.")
+        return False
+    print("[TICKET] Claimed - ticket updated.")
 
     # SPECIAL CASE: Server -> ✅ ⚠️ (Claim -> Action -> Mark as Verified immediately)
     if is_returning_user:
@@ -527,19 +613,19 @@ def process_ticket():
         select_discord_action_menu_item("discord_menu_mark_verified.png")
         return False
 
-    # Copy the phone number as-is (leading 0 is fine, iTunes strips spaces automatically)
-    phone_number = copy_value_next_to_label("discord_number_label.png", x_offset=65, is_valid=looks_like_phone)
+    # Copy the phone number as-is (leading 0 and spaces are fine, iTunes strips spaces automatically)
+    number_region = screen_area_around(anchor.x, anchor.y, left=250, up=170, right=250, down=0)
+    phone_number = copy_ticket_value("discord_number_label.png", number_region, extract_phone, NUMBER_BOX_OFFSETS)
     if not phone_number:
-        print("[WARN] Could not read phone number from embed. Retrying copy...")
-        human_pause(0.8, 1.2)
-        phone_number = copy_value_next_to_label("discord_number_label.png", x_offset=75, is_valid=looks_like_phone)
+        print("[WARN] Could not copy a valid phone number. Leaving this ticket for a human.")
+        return False
     print(f"[TICKET] Copied phone number: '{phone_number}'")
 
     # Switch to iTunes
     switch_to_itunes()
 
     # Ensure iTunes is on the Add Payment -> Mobile Carrier (+33) screen
-    if not wait_for_element("itunes_phone_input.png", timeout=3, confidence=0.80):
+    if not wait_for_element("itunes_phone_input.png", timeout=2, confidence=0.80):
         run_itunes_reset_cycle(return_to_discord=False)
 
     # Click inside the +33 phone number field and paste as-is
@@ -552,7 +638,7 @@ def process_ticket():
 
     # Scroll down and click Submit
     human_scroll(-5)
-    click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=COORDS_1440x900["itunes_submit_phone"], timeout=4)
+    click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=COORDS_1440x900["itunes_submit_phone"], timeout=3)
 
     print("[ITUNES] Waiting for iTunes to send the code...")
     result = wait_for_any([
@@ -564,7 +650,6 @@ def process_ticket():
     if result == "itunes_unable_to_send_code.png":
         print("[ERROR POPUP] 'Unable to Send Code' detected! Resetting iTunes and rejecting ticket...")
         click_element("itunes_popup_ok_btn.png", confidence=0.80, timeout=3)
-        human_pause(0.6, 1.0)
         run_itunes_reset_cycle(return_to_discord=True)
 
         # In Discord: click Reject directly if visible; if user submitted code, click Action -> Reject
@@ -594,14 +679,14 @@ def process_ticket():
 
         # Switch to iTunes, enter the code, and click Submit
         switch_to_itunes()
-        code_box = wait_for_element("itunes_enter_code_input.png", timeout=5, confidence=0.80)
+        code_box = wait_for_element("itunes_enter_code_input.png", timeout=4, confidence=0.80)
         if code_box:
             human_click(code_box.x + 30, code_box.y)
         else:
             human_click(*COORDS_1440x900["itunes_enter_code_box"])
         replace_field_text(code)
 
-        click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=COORDS_1440x900["itunes_submit_code"], timeout=4)
+        click_element("itunes_submit_btn.png", confidence=0.82, fallback_coord=COORDS_1440x900["itunes_submit_code"], timeout=3)
 
         print("[ITUNES] Waiting for iTunes to check the code...")
         outcome = wait_for_any([
@@ -614,13 +699,11 @@ def process_ticket():
         if outcome == "itunes_unable_to_verify_code.png":
             print(f"[WRONG CODE] 'Unable to Verify Code' on attempt {attempt}!")
             click_element("itunes_popup_ok_btn.png", confidence=0.80, timeout=3)
-            human_pause(0.6, 1.0)
 
             if attempt == 1:
                 # 1st wrong code: click "Didn't get a verification code?" in iTunes
                 print("[RETRY] Clicking 'Didn't get a verification code?' in iTunes...")
                 click_element("itunes_didnt_get_code_link.png", confidence=0.80, fallback_coord=COORDS_1440x900["itunes_didnt_get_code"], timeout=4)
-                human_pause(0.8, 1.2)
 
                 # Switch to Discord and wait for Resend Code button to become available/bright
                 switch_to_discord()
@@ -651,7 +734,7 @@ def process_ticket():
 
         # OUTCOME C: Success! Manage Payments shows Mobile Phone added
         if outcome == "itunes_mobile_phone_verified.png":
-            print("[SUCCESS] Mobile Phone added in Manage Payments! Completing final Discord steps...")
+            print("[SUCCESS] Mobile Phone added in Manage Payments! Marking the ticket as verified...")
             switch_to_discord()
 
             # Click Mark as Verified button directly (Action menu only used for ✅⚠️ case)
@@ -660,13 +743,6 @@ def process_ticket():
                 click_and_wait_for_update(verified_loc.x, verified_loc.y, "Mark as Verified")
             else:
                 print("[WARN] Mark as Verified button not found")
-
-            # Type "im the bot and done" in the channel chat bar and stop claiming!
-            if click_element("discord_chat_input.png", confidence=0.80, timeout=5):
-                human_type("im the bot and done")
-                human_pause(0.3, 0.6)
-                human_press("enter")
-                print("[FINISHED] Typed 'im the bot and done'. Stopping bot completely!")
             return True
 
         print(f"[WARN] iTunes showed no result after the code on attempt {attempt}")
@@ -677,15 +753,47 @@ def process_ticket():
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
+def ask_verification_limit():
+    """How many verifications to do before stopping: `python bot.py 2`, or asked at startup. None = no limit."""
+    if len(sys.argv) > 1:
+        answer = sys.argv[1].strip()
+        return int(answer) if answer.isdigit() and int(answer) > 0 else None
+    while True:
+        try:
+            answer = input("How many verifications before the bot stops? (1, 2, 3 ... or press Enter for no limit): ").strip()
+        except EOFError:
+            return None
+        if not answer:
+            return None
+        if answer.isdigit() and int(answer) > 0:
+            return int(answer)
+        print("Please type a whole number like 1, 2 or 3, or just press Enter for no limit.")
+
+
+def send_done_message():
+    """Types "im the bot and done" in the current channel's chat bar."""
+    switch_to_discord()
+    if click_element("discord_chat_input.png", confidence=0.80, timeout=5):
+        human_type("im the bot and done")
+        human_pause(0.2, 0.4)
+        human_press("enter")
+        print("[FINISHED] Typed 'im the bot and done'.")
+    else:
+        print("[WARN] Could not find the chat bar to send the done message")
+
+
 def main():
     global last_itunes_cycle_time
     print("==================================================================")
     print("  DISCORD <-> ITUNES VISUAL AUTOMATION BOT (1440x900 @ 100%)")
     print("  Safety Abort: Slam mouse into ANY of the 4 screen corners.")
     print("==================================================================")
+    limit = ask_verification_limit()
+    print(f"[SETUP] Will stop after {limit} verification(s)." if limit else "[SETUP] No limit - runs until you close it.")
     print("Starting in 3 seconds...")
     time.sleep(3)
 
+    verified = 0
     last_itunes_cycle_time = time.time()
     switch_to_discord()
 
@@ -696,18 +804,23 @@ def main():
             print("[10-MIN TIMER] 10 minutes reached! Running iTunes keep-alive cycle...")
             run_itunes_reset_cycle(return_to_discord=True)
 
-        # 2. Watch for a new ticket (either on Discord screen or Windows toast notification)
-        if locate_element("notif_new_ticket_blue.png", confidence=0.80) or locate_element("notif_new_ticket_purple.png", confidence=0.80):
-            switch_to_discord()
+        # 2. A new-ticket notification takes the bot straight to that ticket's channel
+        open_ticket_from_notification()
 
-        if locate_element("discord_claim_btn.png", confidence=0.84, pick_bottom=True):
-            done = process_ticket()
-            if done:
-                print("[COMPLETE] Verification goal achieved. Bot is now exiting.")
-                sys.exit(0)
+        # 3. Claim and handle the newest ticket on screen
+        if locate_element("discord_claim_btn.png", confidence=CONFIDENCE, pick_bottom=True):
+            if process_ticket():
+                verified += 1
+                print(f"[COMPLETE] Verified {verified}" + (f"/{limit}" if limit else "") + ".")
+                if limit and verified >= limit:
+                    send_done_message()
+                    print("[COMPLETE] Verification goal reached. Bot is now exiting.")
+                    sys.exit(0)
+                # Get iTunes back to the Mobile Carrier form so the next ticket starts right away
+                run_itunes_reset_cycle(return_to_discord=True)
             print("[WAIT] Ticket finished. Watching Discord for the next ticket...")
 
-        human_pause(0.8, 1.3)
+        human_pause(0.3, 0.6)
 
 
 if __name__ == "__main__":

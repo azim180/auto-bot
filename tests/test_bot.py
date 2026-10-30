@@ -162,34 +162,75 @@ class TestReturningUserWarning(unittest.TestCase):
         self.assertFalse(bot.has_returning_user_warning((0, 0, 400, 200)))
 
 
-class TestValueChecks(unittest.TestCase):
-    def test_phone_numbers(self):
-        for text in ("0612345678", "+33 6 12 34 56 78", "06 12 34 56 78"):
-            self.assertTrue(bot.looks_like_phone(text), text)
-        for text in ("", "Number", "Number -> 0612345678", "12"):
-            self.assertFalse(bot.looks_like_phone(text), text)
-
-    def test_codes(self):
-        for text in ("1234", "123456"):
-            self.assertTrue(bot.looks_like_code(text), text)
-        for text in ("", "12", "5 seconds ago", "Code"):
-            self.assertFalse(bot.looks_like_code(text), text)
-
-
 Point = __import__("collections").namedtuple("Point", "x y")
 
 
-class TestCopyValueDoubleClick(unittest.TestCase):
+def _fake_screenshot(img):
+    return lambda region=None, *a, **k: img.crop(
+        (region[0], region[1], region[0] + region[2], region[1] + region[3]))
+
+
+def _ticket_row(box_left=150, box_right=222, y=120):
+    """A Discord embed row: embed background with the grey value box and some 'text' inside it."""
+    from PIL import Image
+    img = Image.new("RGB", (400, 200), (36, 36, 41))
+    for x in range(box_left, box_right + 1):
+        for yy in range(y - 6, y + 7):
+            img.putpixel((x, yy), bot.VALUE_BOX_RGB)
+    for x in range(box_left + 3, box_right - 3, 3):
+        for yy in range(y - 3, y + 4):
+            img.putpixel((x, yy), (220, 220, 225))
+    return img
+
+
+class TestValueExtraction(unittest.TestCase):
+    def test_phone_numbers(self):
+        cases = {
+            "06 12 36 54 85": "06 12 36 54 85",
+            " 06 12 36 54 85\n": "06 12 36 54 85",
+            "Number \u2192 06 12 36 54 85": "06 12 36 54 85",
+            "+33 6 12 34 56 78": "+33 6 12 34 56 78",
+            "0612365485": "0612365485",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(bot.extract_phone(text), expected, text)
+        for text in ("", "36", "06 12", "Number"):
+            self.assertEqual(bot.extract_phone(text), "", text)
+
+    def test_codes(self):
+        for text in ("1122", " 1122 ", "Code \u2192 1122"):
+            self.assertEqual(bot.extract_code(text), "1122", text)
+        for text in ("", "12", "5 seconds ago", "Code"):
+            self.assertEqual(bot.extract_code(text), "", text)
+
+
+class TestFindValueBox(unittest.TestCase):
+    def test_finds_the_box_right_of_the_label(self):
+        from unittest import mock
+        with mock.patch.object(bot.pyautogui, "screenshot", _fake_screenshot(_ticket_row()), create=True):
+            self.assertEqual(bot.find_value_box(Point(111, 120)), (150, 222))
+
+    def test_returns_none_without_a_box(self):
+        from unittest import mock
+        from PIL import Image
+        plain = Image.new("RGB", (400, 200), (36, 36, 41))
+        with mock.patch.object(bot.pyautogui, "screenshot", _fake_screenshot(plain), create=True):
+            self.assertIsNone(bot.find_value_box(Point(111, 120)))
+
+
+class TestCopyTicketValue(unittest.TestCase):
     def setUp(self):
         from unittest import mock
-        self.clicks = []
-        self.clipboard = []
+        self.clicks, self.moves, self.drags, self.clipboard = [], [], [], []
         self._patchers = [
             mock.patch.object(bot, "human_pause", lambda *a, **k: None),
-            mock.patch.object(bot, "wait_for_element", lambda *a, **k: Point(100, 200)),
+            mock.patch.object(bot, "wait_for_element", lambda *a, **k: Point(111, 120)),
+            mock.patch.object(bot, "find_value_box", lambda label: (150, 222)),
             mock.patch.object(bot, "set_clipboard_text", lambda text: None),
             mock.patch.object(bot, "get_clipboard_text", lambda: self.clipboard.pop(0) if self.clipboard else ""),
             mock.patch.object(bot.pyautogui, "click", lambda *a, **k: self.clicks.append(k.get("clicks", 1))),
+            mock.patch.object(bot.pyautogui, "moveTo", lambda x, y, **k: self.moves.append((x, y))),
+            mock.patch.object(bot.pyautogui, "dragTo", lambda x, y, **k: self.drags.append((x, y))),
         ]
         for p in self._patchers:
             p.start()
@@ -198,17 +239,105 @@ class TestCopyValueDoubleClick(unittest.TestCase):
         for p in self._patchers:
             p.stop()
 
-    def test_double_clicks_the_number(self):
-        self.clipboard = ["06 12 34 56 78"]
-        result = bot.copy_value_next_to_label("discord_number_label.png", is_valid=bot.looks_like_phone)
-        self.assertEqual(result, "06 12 34 56 78")
+    def test_double_clicks_the_middle_of_the_code_box(self):
+        self.clipboard = ["1122"]
+        code = bot.copy_ticket_value("discord_code_label.png", (0, 0, 400, 200), bot.extract_code,
+                                     bot.CODE_BOX_OFFSETS, drag_fallback=False)
+        self.assertEqual(code, "1122")
         self.assertEqual(self.clicks, [2])
+        self.assertEqual(self.drags, [])
+        self.assertLessEqual(abs(self.moves[0][0] - 186), 1)
 
-    def test_retries_when_copied_text_is_not_a_number(self):
-        self.clipboard = ["Number", "0612345678"]
-        result = bot.copy_value_next_to_label("discord_number_label.png", is_valid=bot.looks_like_phone)
-        self.assertEqual(result, "0612345678")
-        self.assertEqual(self.clicks, [2, 2])
+    def test_spaced_number_falls_back_to_dragging_the_whole_box(self):
+        self.clipboard = ["36", "06 12 36 54 85"]
+        number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
+                                       bot.NUMBER_BOX_OFFSETS)
+        self.assertEqual(number, "06 12 36 54 85")
+        self.assertEqual(self.clicks, [2])
+        self.assertEqual(self.drags, [(226, 120)])
+
+    def test_gives_up_with_empty_string(self):
+        self.clipboard = ["36", "36", "54", "54"]
+        number = bot.copy_ticket_value("discord_number_label.png", (0, 0, 400, 200), bot.extract_phone,
+                                       bot.NUMBER_BOX_OFFSETS)
+        self.assertEqual(number, "")
+
+
+class TestWaitForClaim(unittest.TestCase):
+    def test_returns_reject_once_claim_is_replaced(self):
+        from unittest import mock
+        polls = {"claim": 0}
+
+        def fake_locate(name, **kwargs):
+            if name == "discord_claim_btn.png":
+                polls["claim"] += 1
+                return Point(100, 200) if polls["claim"] <= 2 else None
+            if name == "discord_reject_btn.png":
+                return Point(220, 200) if polls["claim"] > 2 else None
+            return None
+
+        with mock.patch.object(bot, "locate_element", fake_locate), \
+             mock.patch.object(bot, "wait_for_screen_settle", lambda *a, **k: True):
+            self.assertEqual(bot.wait_for_claim_to_register(Point(100, 200), timeout=2), Point(220, 200))
+
+    def test_none_when_claim_never_goes_away(self):
+        from unittest import mock
+        with mock.patch.object(bot, "locate_element",
+                               lambda name, **k: Point(100, 200) if name == "discord_claim_btn.png" else None):
+            self.assertIsNone(bot.wait_for_claim_to_register(Point(100, 200), timeout=0.3))
+
+
+class TestNotificationOpensTicket(unittest.TestCase):
+    def test_clicks_the_toast_and_waits_for_claim(self):
+        from unittest import mock
+        clicked = []
+        with mock.patch.object(bot, "locate_element",
+                               lambda name, **k: Point(1200, 760) if name == "notif_new_ticket_purple.png" else None), \
+             mock.patch.object(bot, "human_click", lambda x, y, **k: clicked.append((x, y))), \
+             mock.patch.object(bot, "wait_for_window", lambda *a, **k: True), \
+             mock.patch.object(bot, "wait_for_element", lambda *a, **k: Point(100, 200)):
+            self.assertTrue(bot.open_ticket_from_notification())
+        self.assertEqual(clicked, [(1200, 760)])
+
+    def test_nothing_happens_without_a_toast(self):
+        from unittest import mock
+        with mock.patch.object(bot, "locate_element", lambda *a, **k: None), \
+             mock.patch.object(bot, "human_click", lambda *a, **k: self.fail("should not click")):
+            self.assertFalse(bot.open_ticket_from_notification())
+
+
+class TestResetCycleFromManagePayments(unittest.TestCase):
+    def test_clicks_add_payment_directly_when_mobile_phone_is_listed(self):
+        from unittest import mock
+        visible = {"itunes_add_payment_btn.png", "itunes_mobile_phone_verified.png",
+                   "itunes_mobile_carrier_icon.png", "itunes_phone_input.png"}
+        clicked = []
+        found = lambda name, **k: Point(1, 1) if name in visible else None
+        with mock.patch.object(bot, "locate_element", found), \
+             mock.patch.object(bot, "wait_for_element", found), \
+             mock.patch.object(bot, "click_element", lambda name, **k: clicked.append(name) or Point(1, 1)), \
+             mock.patch.object(bot, "switch_to_itunes", lambda: None), \
+             mock.patch.object(bot, "human_pause", lambda *a, **k: None):
+            bot.run_itunes_reset_cycle(return_to_discord=False)
+        self.assertEqual(clicked, ["itunes_add_payment_btn.png", "itunes_mobile_carrier_icon.png"])
+
+
+class TestVerificationLimit(unittest.TestCase):
+    def test_from_command_line(self):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["bot.py", "2"]):
+            self.assertEqual(bot.ask_verification_limit(), 2)
+        with mock.patch.object(sys, "argv", ["bot.py", "0"]):
+            self.assertIsNone(bot.ask_verification_limit())
+
+    def test_asks_until_a_number_or_blank(self):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["bot.py"]), \
+             mock.patch("builtins.input", side_effect=["abc", "3"]), \
+             mock.patch("builtins.print"):
+            self.assertEqual(bot.ask_verification_limit(), 3)
+        with mock.patch.object(sys, "argv", ["bot.py"]), mock.patch("builtins.input", return_value=""):
+            self.assertIsNone(bot.ask_verification_limit())
 
 
 class TestWaitForDiscordUpdate(unittest.TestCase):
