@@ -75,7 +75,8 @@ EMBED_SETTLE_SECONDS = 0.35
 EMBED_UPDATE_TIMEOUT = 8
 
 # Inline-code box behind the Number / Code values, and where it sits relative to the
-# label's center when it cannot be detected (measured on the ticket embed at 100% size)
+# label's center when it cannot be detected (measured on the ticket embed at 100% size).
+# The colour depends on Discord's theme: it is read again from every claimed ticket's number box.
 VALUE_BOX_RGB = (40, 41, 57)
 NUMBER_BOX_OFFSETS = (38, 110)
 CODE_BOX_OFFSETS = (31, 56)
@@ -432,14 +433,39 @@ def grab_screen():
         return None
 
 
+_variant_names = {}
+
+
+def _variants(image_name):
+    """
+    The image, plus look-alikes cropped on another PC (images/<name>@<anything>.png): text can be
+    drawn a pixel wider there, enough to miss with the first crop.
+    """
+    if image_name not in _variant_names:
+        stem = image_name[:-len(".png")]
+        try:
+            extra = sorted(f for f in os.listdir(IMAGES_DIR) if f.startswith(stem + "@") and f.endswith(".png"))
+        except OSError:
+            extra = []
+        _variant_names[image_name] = [image_name] + extra
+    return _variant_names[image_name]
+
+
 def _match_scores(image_name, region=None, screen=None):
     """
-    Template-matches an image, at its app's current size, against the screen (or `region`):
-    (scores, x0, y0, w, h, scale) or None.
+    Template-matches an image (the best of its variants), at its app's current size, against the
+    screen (or `region`): (scores, x0, y0, w, h, scale) or None.
     """
     scale = ui_scale[group_of(image_name)]
-    found = _match(_template_at(image_name, scale), region, screen, soften=scale if scale != 1.0 else None)
-    return None if found is None else found + (scale,)
+    names = _variants(image_name)
+    if len(names) > 1 and screen is None:
+        screen = grab_screen()  # one screenshot for all of them
+    best = None
+    for name in names:
+        found = _match(_template_at(name, scale), region, screen, soften=scale if scale != 1.0 else None)
+        if found is not None and (best is None or found[0].max() > best[0].max()):
+            best = found
+    return None if best is None else best + (scale,)
 
 
 def _match(template, region=None, screen=None, soften=None):
@@ -490,6 +516,15 @@ def _anchor_score(group, scale, haystack, half=False, enough=1.0):
     return best
 
 
+def _still_screen():
+    """
+    A screenshot once the screen stopped changing. A window that is being opened (from the
+    taskbar) is drawn smaller for a moment, which must not be measured as its size.
+    """
+    wait_for_screen_settle(None, settle=0.2, timeout=1.5, interval=0.05)
+    return grab_screen()
+
+
 def calibrate_scale(group, screen=None, search=True):
     """
     Measures how big `group`'s app is drawn, from images that are always on screen while it is in
@@ -505,7 +540,7 @@ def calibrate_scale(group, screen=None, search=True):
         if time.time() - _last_calibration.get(group, -CALIBRATION_RETRY_SECONDS) < CALIBRATION_RETRY_SECONDS:
             return False
         _last_calibration[group] = time.time()
-    screen = screen if screen is not None else grab_screen()
+    screen = screen if screen is not None else _still_screen()
     if screen is None:
         return False
     haystack = _bgr(screen)
@@ -521,7 +556,13 @@ def calibrate_scale(group, screen=None, search=True):
     ranked = sorted(candidates[1:], key=lambda s: _anchor_score(group, s, small, half=True), reverse=True)
     best_score, best_scale = max((_anchor_score(group, s, haystack), s) for s in ranked[:2]) if ranked else (0, None)
     if best_score >= SCALE_ADOPT_CONFIDENCE:
-        return _adopt_scale(group, best_scale)
+        # Only a size seen twice is taken (a window still opening looks smaller at first)
+        again = _still_screen()
+        haystack = _bgr(again) if again is not None else haystack
+        if _anchor_score(group, expected, haystack, enough=enough) >= enough:
+            return _adopt_scale(group, expected)
+        if _anchor_score(group, best_scale, haystack) >= SCALE_ADOPT_CONFIDENCE:
+            return _adopt_scale(group, best_scale)
     _calibration_searches[group] += 1
     if _calibration_searches[group] == MAX_CALIBRATION_SEARCHES:
         print(f"[SCALE] Could not measure {UI_GROUPS[group]}'s size; keeping {ui_scale[group]:.0%}.")
@@ -556,6 +597,11 @@ def recheck_scale(group, screen=None):
         return True
     scale = ui_scale[group]
     enough = _threshold(CONFIDENCE, scale)
+    if _anchor_score(group, scale, _bgr(screen), enough=enough) >= enough:
+        return True
+    # Look again once the screen is still: the window may have been opening a moment ago
+    again = _still_screen()
+    screen = again if again is not None else screen
     if _anchor_score(group, scale, _bgr(screen), enough=enough) >= enough:
         return True
     print(f"[SCALE] {UI_GROUPS[group]} no longer looks {scale:.0%} big - measuring it again...")
@@ -1148,18 +1194,60 @@ def run_itunes_reset_cycle(return_to_discord=True):
 # ==============================================================================
 # DISCORD TEXT EXTRACTION & ACTIONS
 # ==============================================================================
+value_box_rgb = VALUE_BOX_RGB  # the box colour in this Discord's theme
+
+
+def _value_row(label, length=260):
+    """The pixels of the row through the top padding of the box right of a `Label →` (solid, no text)."""
+    try:
+        raw = pyautogui.screenshot(region=(int(label.x), int(label.y) - px(5), px(length), 1)).convert("RGB").tobytes()
+    except Exception:
+        return []
+    return [tuple(raw[i:i + 3]) for i in range(0, len(raw) - 2, 3)]
+
+
+def _color_runs(pixels, min_length):
+    """(start, end, colour) of each stretch of one colour (within a few shades) at least `min_length` long."""
+    runs, start = [], 0
+    for i in range(1, len(pixels) + 1):
+        if i == len(pixels) or max(abs(a - b) for a, b in zip(pixels[i], pixels[start])) > 3:
+            if i - start >= min_length:
+                runs.append((start, i - 1, pixels[start]))
+            start = i
+    return runs
+
+
+def learn_value_box_color(number_label):
+    """
+    Reads the colour of the box behind values from the phone number's box, which is always there.
+    Discord themes draw it in different colours; the Code's 4 digits are only copied from a box of
+    this colour (not from the "17 seconds ago" timer, which is highlighted in another colour).
+    """
+    global value_box_rgb
+    row = _value_row(number_label, length=130)
+    if not row:
+        return
+    background = row[0]
+    for start, end, colour in _color_runs(row, px(20)):
+        if start <= px(60) and max(abs(a - b) for a, b in zip(colour, background)) > 6:
+            if colour != value_box_rgb:
+                print(f"[THEME] Discord draws the value boxes in {colour} here (was looking for {value_box_rgb}).")
+                value_box_rgb = colour
+            return
+
+
+def describe_value_row(label):
+    """What is right of a `Label →`, for the console when its box is not found."""
+    runs = _color_runs(_value_row(label), 3)
+    return ", ".join(f"{colour} x{end - start + 1}" for start, end, colour in runs) or "nothing readable"
+
+
 def find_value_box(label):
     """Returns (left, right) of the grey inline-code box to the right of a `Label →`, or None."""
-    probe_y = int(label.y) - px(5)  # top padding row of the box: solid colour, no text
     x0 = int(label.x)
-    try:
-        raw = pyautogui.screenshot(region=(x0, probe_y, px(260), 1)).convert("RGB").tobytes()
-    except Exception:
-        return None
-    br, bg, bb = VALUE_BOX_RGB
+    br, bg, bb = value_box_rgb
     run_start = None
-    for i in range(len(raw) // 3):
-        r, g, b = raw[3 * i:3 * i + 3]
+    for i, (r, g, b) in enumerate(_value_row(label) + [(-99, -99, -99)]):
         inside = abs(r - br) <= 6 and abs(g - bg) <= 6 and abs(b - bb) <= 8
         if inside and run_start is None:
             run_start = i
@@ -1279,6 +1367,9 @@ def wait_for_user_code(ticket, timeout=CODE_WAIT_TIMEOUT, previous_code=None):
                                      require_box=True)
             if not code and not told_no_box:
                 print("[WAIT] Code is not in its box yet (timer showing); waiting for the 4-digit code...")
+                label = locate_element("discord_code_label.png", confidence=0.82, region=region, pick_bottom=True)
+                if label:
+                    print(f"[WAIT] (Looking for a box in {value_box_rgb}; right of Code there is: {describe_value_row(label)})")
                 told_no_box = True
             if code and code == previous_code:
                 if not told_old_code:
@@ -1485,6 +1576,7 @@ def claim_ticket():
     if not number_label:
         print("[WARN] Could not find the ticket's Number. Leaving this ticket for a human.")
         return None
+    learn_value_box_color(number_label)
     box = find_value_box(number_label) or (number_label.x + px(NUMBER_BOX_OFFSETS[0]), number_label.x + px(NUMBER_BOX_OFFSETS[1]))
     ticket = Ticket(box[0], box[1], number_label.y, server=current_server)
 
@@ -1563,10 +1655,11 @@ def verify_with_itunes(ticket, phone_number):
     click_itunes_submit("itunes_submit_phone")
 
     print("[ITUNES] Waiting for iTunes to send the code...")
+    # (it moves on as soon as the page shows; some PCs/connections take a while to send the code)
     result = wait_for_any([
         ("itunes_unable_to_send_code.png", 0.80),
         ("itunes_enter_code_input.png", 0.80),
-    ], timeout=15, watch_tickets=True)
+    ], timeout=30, watch_tickets=True)
 
     # CHECK 1: Did "Unable to Send Code" popup appear?
     if result == "itunes_unable_to_send_code.png":

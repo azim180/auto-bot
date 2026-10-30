@@ -38,6 +38,16 @@ recognised by a snapshot of its number, which no longer matches after a
 scaling or zoom change (a resolution change alone is fine), so tickets already
 claimed at that moment are left for a human.
 
+ANOTHER PC:
+- Discord's theme: the box behind the Number and Code values is drawn in
+  another colour by other Discord themes. The bot reads that colour from
+  every claimed ticket's number box ("[THEME] ..."), so the Code is copied in
+  any theme.
+- Fonts: a PC can draw some text a pixel wider, so an image cropped on one PC
+  can miss on another. Put a crop from that PC next to the original as
+  images/<same name>@<anything>.png (e.g. itunes_didnt_get_code_link@1080p.png):
+  the bot then tries both.
+
 BACKUP CLICK SPOTS:
 If a button's image is missed, the bot clicks where it last saw that button
 on this screen (it remembers them in learned_spots.json; delete that file if

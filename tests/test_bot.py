@@ -250,6 +250,45 @@ class TestFindValueBox(unittest.TestCase):
             self.assertIsNone(bot.find_value_box(Point(111, 120)))
 
 
+class TestOtherDiscordTheme(unittest.TestCase):
+    """Another Discord theme draws the value boxes in another colour: it is read from the number box."""
+    THEMED_BOX = (52, 44, 38)
+
+    def setUp(self):
+        from unittest import mock
+        patcher = mock.patch.object(bot, "value_box_rgb", bot.VALUE_BOX_RGB)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _on(self, row, fn):
+        from unittest import mock
+        with mock.patch.object(bot.pyautogui, "screenshot", _fake_screenshot(row), create=True), \
+             mock.patch("builtins.print"):
+            return fn()
+
+    def test_the_code_box_is_found_after_reading_the_colour_from_the_number_box(self):
+        themed = _ticket_row(box_rgb=self.THEMED_BOX)
+        self.assertIsNone(self._on(themed, lambda: bot.find_value_box(Point(111, 120))))
+        self._on(themed, lambda: bot.learn_value_box_color(Point(111, 120)))
+        self.assertEqual(bot.value_box_rgb, self.THEMED_BOX)
+        self.assertEqual(self._on(themed, lambda: bot.find_value_box(Point(111, 120))), (150, 222))
+
+    def test_the_timer_is_still_not_taken_for_the_code(self):
+        self._on(_ticket_row(box_rgb=self.THEMED_BOX), lambda: bot.learn_value_box_color(Point(111, 120)))
+        timer_row = _ticket_row(box_rgb=TIMESTAMP_BOX_RGB)
+        self.assertIsNone(self._on(timer_row, lambda: bot.find_value_box(Point(111, 120))))
+
+    def test_nothing_learned_without_a_box(self):
+        from PIL import Image
+        plain = Image.new("RGB", (400, 200), (36, 36, 41))
+        self._on(plain, lambda: bot.learn_value_box_color(Point(111, 120)))
+        self.assertEqual(bot.value_box_rgb, bot.VALUE_BOX_RGB)
+
+    def test_the_console_says_what_is_there(self):
+        text = self._on(_ticket_row(box_rgb=self.THEMED_BOX), lambda: bot.describe_value_row(Point(111, 120)))
+        self.assertIn(str(self.THEMED_BOX), text)
+
+
 class TestCopyTicketValue(unittest.TestCase):
     def setUp(self):
         from unittest import mock
@@ -475,6 +514,16 @@ class TestBestMatch(unittest.TestCase):
         screen = self._screen_with([(reject, (100, 100)), (reject, (100, 600))], bg=(49, 51, 56))
         loc = self._locate(screen, "discord_reject_btn.png", confidence=0.82, pick_bottom=True)
         self.assertEqual(loc, bot.Point(100 + reject.width // 2, 600 + reject.height // 2))
+
+    def test_a_variant_cropped_on_another_pc_is_used_too(self):
+        from PIL import Image
+        # On the 1080p PC iTunes draws this link a few pixels wider: the 1440x900 crop scores 0.72 there
+        variant = Image.open(bot.img_path("itunes_didnt_get_code_link@1080p.png")).convert("RGB")
+        screen = Image.new("RGB", (1920, 1080), (255, 255, 255))
+        screen.paste(variant, (693, 279))
+        loc = bot.locate_element("itunes_didnt_get_code_link.png", confidence=0.80, screen=screen)
+        self.assertEqual(loc, Point(693 + variant.width // 2, 279 + variant.height // 2))
+        self.assertEqual(bot._variants("itunes_submit_btn.png"), ["itunes_submit_btn.png"])
 
     def test_nothing_found_returns_none(self):
         screen = self._screen_with([])
@@ -1034,6 +1083,17 @@ class TestAnySize(unittest.TestCase):
         with self._unmeasured("windows", display=1.25), mock_print():
             self.assertTrue(bot.calibrate_scale("windows", screen, search=False))
         self.assertEqual(bot.ui_scale["windows"], 1.25)
+
+    def test_a_window_still_opening_is_not_taken_as_its_size(self):
+        from unittest import mock
+        # Windows draws a window that is being opened smaller for a moment
+        opening = self._screen(0.9, ("discord_chat_input.png", (400, 1000)), ("discord_claim_btn.png", (700, 600)))
+        opened = self._screen(1.0, ("discord_chat_input.png", (400, 1000)), ("discord_claim_btn.png", (700, 600)))
+        with self._unmeasured("discord"), mock_print(), \
+             mock.patch.object(bot, "wait_for_screen_settle", lambda *a, **k: True), \
+             mock.patch.object(bot, "grab_screen", lambda: opened):
+            self.assertTrue(bot.calibrate_scale("discord", opening))
+        self.assertEqual(bot.ui_scale["discord"], 1.0)
 
     def test_nothing_is_adopted_from_a_screen_without_the_app(self):
         with self._unmeasured("itunes"), mock_print():
