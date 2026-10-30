@@ -33,8 +33,10 @@ _pag.easeOutQuad = lambda n: n
 _pag.position = lambda: (0, 0)
 _pag.size = lambda: (1440, 900)
 
-# cv2 stub (opencv-python)
-_stub_module("cv2")
+# cv2 stub (opencv-python) only where it is not installed; the matcher tests need the real one
+import importlib.util
+if importlib.util.find_spec("cv2") is None:
+    _stub_module("cv2")
 
 # tkinter stub
 _tk = _stub_module("tkinter")
@@ -133,7 +135,6 @@ class TestReturningUserWarning(unittest.TestCase):
     """✅⚠️ must trigger the special case; ✅ alone must not."""
 
     def _run(self, warn_visible):
-        from collections import namedtuple
         from PIL import Image
 
         line = Image.open(bot.img_path("discord_server_returning_warn.png")).convert("RGB")
@@ -145,11 +146,11 @@ class TestReturningUserWarning(unittest.TestCase):
         screen = Image.new("RGB", (400, 200), line.getpixel((95, 8)))
         screen.paste(line, (100, 50))
 
-        Box = namedtuple("Box", "left top width height")
-        bot.pyautogui.locateOnScreen = lambda *a, **k: Box(100, 50, 80, 17)
-        bot.pyautogui.screenshot = lambda region: screen.crop(
-            (region[0], region[1], region[0] + region[2], region[1] + region[3]))
-        return bot.has_returning_user_warning((0, 0, 400, 200))
+        from unittest import mock
+        with mock.patch.object(bot, "locate_box", lambda *a, **k: (100, 50, 80, 17)), \
+             mock.patch.object(bot.pyautogui, "screenshot", lambda region: screen.crop(
+                 (region[0], region[1], region[0] + region[2], region[1] + region[3])), create=True):
+            return bot.has_returning_user_warning((0, 0, 400, 200))
 
     def test_check_and_warning_is_special_case(self):
         self.assertTrue(self._run(warn_visible=True))
@@ -158,8 +159,9 @@ class TestReturningUserWarning(unittest.TestCase):
         self.assertFalse(self._run(warn_visible=False))
 
     def test_server_line_not_found(self):
-        bot.pyautogui.locateOnScreen = lambda *a, **k: None
-        self.assertFalse(bot.has_returning_user_warning((0, 0, 400, 200)))
+        from unittest import mock
+        with mock.patch.object(bot, "locate_box", lambda *a, **k: None):
+            self.assertFalse(bot.has_returning_user_warning((0, 0, 400, 200)))
 
 
 Point = __import__("collections").namedtuple("Point", "x y")
@@ -391,6 +393,67 @@ class TestActionMenuUsesNewestTicket(unittest.TestCase):
              mock.patch.object(bot, "click_and_wait_for_update", lambda *a, **k: None):
             self.assertTrue(bot.select_discord_action_menu_item("discord_menu_mark_verified.png"))
         self.assertTrue(calls["discord_action_dropdown.png"]["pick_bottom"])
+
+
+@unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
+class TestBestMatch(unittest.TestCase):
+    """locate_element must return the best match, not the first lookalike in reading order."""
+
+    def _screen_with(self, placements, size=(1440, 900), bg=(255, 255, 255)):
+        from PIL import Image
+        screen = Image.new("RGB", size, bg)
+        for img, xy in placements:
+            screen.paste(img, xy)
+        return screen
+
+    def _locate(self, screen, *args, **kwargs):
+        from unittest import mock
+        with mock.patch.object(bot.pyautogui, "screenshot", lambda region=None: screen if region is None else
+                               screen.crop((region[0], region[1], region[0] + region[2], region[1] + region[3])),
+                               create=True):
+            return bot.locate_element(*args, **kwargs)
+
+    def test_add_payment_button_beats_a_lookalike_higher_up(self):
+        import numpy as np
+        from PIL import Image
+        button = Image.open(bot.img_path("itunes_add_payment_btn.png")).convert("RGB")
+        rng = np.random.default_rng(0)
+        noisy = np.clip(np.array(button, dtype=int) + rng.integers(-60, 60, (button.height, button.width, 3)), 0, 255)
+        lookalike = Image.fromarray(noisy.astype("uint8"))
+        screen = self._screen_with([(lookalike, (190, 360)), (button, (1056, 377))])
+        loc = self._locate(screen, "itunes_add_payment_btn.png", confidence=0.5)
+        self.assertEqual(loc, bot.Point(1056 + button.width // 2, 377 + button.height // 2))
+
+    def test_pick_bottom_returns_the_lowest_copy(self):
+        from PIL import Image
+        reject = Image.open(bot.img_path("discord_reject_btn.png")).convert("RGB")
+        screen = self._screen_with([(reject, (100, 100)), (reject, (100, 600))], bg=(49, 51, 56))
+        loc = self._locate(screen, "discord_reject_btn.png", confidence=0.82, pick_bottom=True)
+        self.assertEqual(loc, bot.Point(100 + reject.width // 2, 600 + reject.height // 2))
+
+    def test_nothing_found_returns_none(self):
+        screen = self._screen_with([])
+        self.assertIsNone(self._locate(screen, "itunes_add_payment_btn.png", confidence=0.88))
+
+    def test_missing_image_returns_none(self):
+        from unittest import mock
+        screen = self._screen_with([])
+        with mock.patch("builtins.print"):
+            self.assertIsNone(self._locate(screen, "does_not_exist.png"))
+
+
+class TestSecondCodeIgnoresTheOldOne(unittest.TestCase):
+    def test_waits_until_the_code_changes(self):
+        from unittest import mock
+        codes = ["1122", "1122", "4567"]
+        with mock.patch.object(bot, "locate_element",
+                               lambda name, **k: Point(100, 200) if name == "discord_mark_verified_btn.png" else None), \
+             mock.patch.object(bot, "switch_to_discord", lambda: None), \
+             mock.patch.object(bot, "wait_for_screen_settle", lambda *a, **k: True), \
+             mock.patch.object(bot, "copy_ticket_value", lambda *a, **k: codes.pop(0)), \
+             mock.patch.object(bot.time, "sleep", lambda s: None), \
+             mock.patch("builtins.print"):
+            self.assertEqual(bot.wait_for_user_code(timeout=5, previous_code="1122"), "4567")
 
 
 if __name__ == "__main__":

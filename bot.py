@@ -5,8 +5,13 @@ import math
 import time
 import random
 import ctypes
+import collections
 import tkinter as tk
+import cv2
+import numpy as np
 import pyautogui
+
+Point = collections.namedtuple("Point", "x y")
 
 # ==============================================================================
 # CONFIGURATION (1440 x 900 Resolution @ 100% Scale)
@@ -16,6 +21,8 @@ pyautogui.PAUSE = 0.05      # Base pause; the human_* helpers add small randomiz
 
 IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
 CONFIDENCE = 0.84
+# The "Add Payment Method" label left of the Add Payment button scores ~0.81 against it
+ADD_PAYMENT_CONFIDENCE = 0.88
 
 # 10-minute timer (600 seconds) for the iTunes keep-alive cycle
 KEEP_ALIVE_INTERVAL = 600
@@ -122,23 +129,76 @@ def screen_area_around(x, y, left=120, up=220, right=260, down=40):
     return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
-def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False):
-    """
-    Finds an image on screen.
-    If pick_bottom=True, picks the lowest match on screen (newest Discord message).
-    """
-    path = img_path(image_name)
-    try:
-        if pick_bottom:
-            boxes = list(pyautogui.locateAllOnScreen(path, confidence=confidence, region=region))
-            if boxes:
-                bottom_box = max(boxes, key=lambda b: b.top)
-                return pyautogui.center(bottom_box)
-            return None
+_templates = {}
+
+
+def _load_template(image_name):
+    if image_name not in _templates:
+        path = img_path(image_name)
+        if os.path.exists(path):
+            # imdecode instead of imread so folders with non-ASCII names still work
+            _templates[image_name] = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         else:
-            return pyautogui.locateCenterOnScreen(path, confidence=confidence, region=region)
+            print(f"[WARN] Missing image: images/{image_name}")
+            _templates[image_name] = None
+    return _templates[image_name]
+
+
+def _match_scores(image_name, region=None):
+    """Template-matches an image against the screen (or `region`): (scores, x0, y0, w, h) or None."""
+    template = _load_template(image_name)
+    if template is None:
+        return None
+    shot = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
+    haystack = cv2.cvtColor(np.array(shot.convert("RGB")), cv2.COLOR_RGB2BGR)
+    h, w = template.shape[:2]
+    if haystack.shape[0] < h or haystack.shape[1] < w:
+        return None
+    scores = np.nan_to_num(cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED), nan=0.0, posinf=0.0, neginf=0.0)
+    x0, y0 = (int(region[0]), int(region[1])) if region else (0, 0)
+    return scores, x0, y0, w, h
+
+
+def locate_box(image_name, confidence=CONFIDENCE, region=None):
+    """(left, top, width, height) of the best match on screen, or None below `confidence`."""
+    try:
+        found = _match_scores(image_name, region)
     except Exception:
         return None
+    if found is None:
+        return None
+    scores, x0, y0, w, h = found
+    _, best, _, (x, y) = cv2.minMaxLoc(scores)
+    if best < confidence:
+        return None
+    return (x0 + int(x), y0 + int(y), w, h)
+
+
+def locate_element(image_name, confidence=CONFIDENCE, region=None, pick_bottom=False):
+    """
+    Finds an image on screen and returns the center of the BEST match. (pyautogui returns the
+    first match above `confidence` in reading order, so a lookalike higher up the screen - like
+    the "Add Payment Method" label next to the Add Payment button - could win.)
+    If pick_bottom=True, picks the lowest match instead (newest Discord message).
+    """
+    if not pick_bottom:
+        box = locate_box(image_name, confidence=confidence, region=region)
+        return Point(box[0] + box[2] // 2, box[1] + box[3] // 2) if box else None
+    try:
+        found = _match_scores(image_name, region)
+    except Exception:
+        return None
+    if found is None:
+        return None
+    scores, x0, y0, w, h = found
+    ys, xs = np.where(scores >= confidence)
+    if len(ys) == 0:
+        return None
+    # Best-scoring spot within the lowest match (matches spread over a few pixels)
+    lowest = ys >= ys.max() - h // 2
+    i = int(np.argmax(scores[ys[lowest], xs[lowest]]))
+    x, y = int(xs[lowest][i]), int(ys[lowest][i])
+    return Point(x0 + x + w // 2, y0 + y + h // 2)
 
 
 def wait_for_element(image_name, timeout=10, confidence=CONFIDENCE, pick_bottom=False, region=None):
@@ -401,9 +461,9 @@ def run_itunes_reset_cycle(return_to_discord=True):
         click_element("itunes_popup_ok_btn.png", confidence=0.82)
         human_pause(0.3, 0.5)
 
-    if locate_element("itunes_add_payment_btn.png", confidence=0.82):
+    if locate_element("itunes_add_payment_btn.png", confidence=ADD_PAYMENT_CONFIDENCE):
         print("[ITUNES CYCLE] Already on Manage Payments - clicking Add Payment...")
-        click_element("itunes_add_payment_btn.png", confidence=0.82)
+        click_element("itunes_add_payment_btn.png", confidence=ADD_PAYMENT_CONFIDENCE)
     else:
         if not wait_for_element("itunes_account_settings_header.png", timeout=1.5, confidence=0.82):
             print("[ITUNES CYCLE] Clicking Account -> View My Account...")
@@ -417,10 +477,10 @@ def run_itunes_reset_cycle(return_to_discord=True):
             click_element("itunes_manage_payments_link.png", fallback_coord=COORDS_1440x900["itunes_manage_payments"])
 
         # Manage Payments shows either the existing list ("Add Payment") or the payment-type picker
-        page = wait_for_any([("itunes_add_payment_btn.png", 0.82), ("itunes_mobile_carrier_icon.png", CONFIDENCE)], timeout=10)
+        page = wait_for_any([("itunes_add_payment_btn.png", ADD_PAYMENT_CONFIDENCE), ("itunes_mobile_carrier_icon.png", CONFIDENCE)], timeout=10)
         if page == "itunes_add_payment_btn.png":
             print("[ITUNES CYCLE] Clicking Add Payment...")
-            click_element("itunes_add_payment_btn.png", confidence=0.82)
+            click_element("itunes_add_payment_btn.png", confidence=ADD_PAYMENT_CONFIDENCE)
 
     # Select Mobile Carrier icon, then wait for the phone form to load
     if wait_for_element("itunes_mobile_carrier_icon.png", timeout=10):
@@ -500,7 +560,7 @@ def select_discord_action_menu_item(menu_item_img):
         return False
     human_click(action_loc.x, action_loc.y)
 
-    loc = wait_for_element(menu_item_img, timeout=5, confidence=0.78, pick_bottom=True)
+    loc = wait_for_element(menu_item_img, timeout=5, confidence=0.78)
     if loc:
         click_and_wait_for_update(loc.x, loc.y, menu_item_img, region=screen_area_around(action_loc.x, action_loc.y))
         return True
@@ -515,14 +575,16 @@ def select_discord_action_menu_item(menu_item_img):
     return False
 
 
-def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT):
+def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=None):
     """
     Waits up to `timeout` seconds (2 minutes) for the user to submit their verification code.
     Watches for either the Windows notification (`notif_code_submitted.png`) or
     the Discord embed updating to show `Mark as Verified` (`discord_mark_verified_btn.png`).
+    `previous_code` (the rejected one) is ignored while it is still showing on the ticket.
     """
     print(f"[WAIT] Waiting up to {timeout}s for user to submit verification code...")
     start = time.time()
+    told_old_code = False
 
     while time.time() - start < timeout:
         # 1. Check if Windows notification popped up showing "Submitted code:"
@@ -541,6 +603,12 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT):
             # Only read the Code from the ticket this button belongs to
             code_region = screen_area_around(mark_loc.x, mark_loc.y, left=200, up=160, right=250, down=0)
             code = copy_ticket_value("discord_code_label.png", code_region, extract_code, CODE_BOX_OFFSETS)
+            if code and code == previous_code:
+                if not told_old_code:
+                    print(f"[WAIT] Ticket still shows the old code {code}; waiting for the new one...")
+                    told_old_code = True
+                time.sleep(1.5)
+                continue
             if code:
                 print(f"[CODE COPIED] Extracted verification code: {code}")
                 return code
@@ -553,15 +621,13 @@ def wait_for_user_code(timeout=CODE_WAIT_TIMEOUT):
 
 def has_returning_user_warning(embed_region):
     """True only when the Server line shows ✅ followed by ⚠️; ✅ alone is a normal ticket."""
-    try:
-        box = pyautogui.locateOnScreen(img_path("discord_server_line.png"), confidence=0.83, region=embed_region)
-    except Exception:
-        box = None
+    box = locate_box("discord_server_line.png", confidence=0.83, region=embed_region)
     if not box:
         return False
+    left, top, width, height = box
     # ⚠️ is too small a part of the line for template matching to tell apart, so count
     # its yellow pixels in the strip just right of the ✅ instead.
-    strip = (int(box.left + box.width), max(0, int(box.top) - 2), 20, int(box.height) + 4)
+    strip = (left + width, max(0, top - 2), 20, height + 4)
     try:
         raw = pyautogui.screenshot(region=strip).convert("RGB").tobytes()
     except Exception:
@@ -660,8 +726,9 @@ def process_ticket():
         return False
 
     # Up to 2 attempts to receive and verify the 4-digit SMS code
+    previous_code = None
     for attempt in (1, 2):
-        code = wait_for_user_code(timeout=CODE_WAIT_TIMEOUT)
+        code = wait_for_user_code(timeout=CODE_WAIT_TIMEOUT, previous_code=previous_code)
 
         # If user did not submit a code within 2 minutes:
         if not code:
@@ -698,13 +765,19 @@ def process_ticket():
                 print("[RETRY] Clicking 'Didn't get a verification code?' in iTunes...")
                 click_element("itunes_didnt_get_code_link.png", confidence=0.80, fallback_coord=COORDS_1440x900["itunes_didnt_get_code"], timeout=4)
 
-                # Switch to Discord and wait for Resend Code button to become available/bright
+                # After a code was submitted the ticket only offers Resend Code inside the Action menu
                 switch_to_discord()
-                print("[RETRY] Waiting for Discord 'Resend Code' button to become available...")
-                resend_loc = wait_for_element("discord_resend_available.png", timeout=30, confidence=0.85, pick_bottom=True)
-                if resend_loc:
-                    click_and_wait_for_update(resend_loc.x, resend_loc.y, "Resend Code")
-                    print("[RETRY] Clicked 'Resend Code'! Waiting 2 more minutes for 2nd code...")
+                print("[RETRY] Clicking Action -> Resend Code in Discord...")
+                if select_discord_action_menu_item("discord_menu_resend_code.png"):
+                    print("[RETRY] Resend Code clicked! Waiting 2 more minutes for the 2nd code...")
+                else:
+                    resend_loc = wait_for_element("discord_resend_available.png", timeout=3, confidence=0.85, pick_bottom=True)
+                    if resend_loc:
+                        click_and_wait_for_update(resend_loc.x, resend_loc.y, "Resend Code")
+                        print("[RETRY] Clicked the Resend Code button! Waiting 2 more minutes for the 2nd code...")
+                    else:
+                        print("[WARN] Could not click Resend Code; still waiting for a new code")
+                previous_code = code
                 continue
             else:
                 # 2nd wrong code: click Failed Verification in Discord and reset iTunes
