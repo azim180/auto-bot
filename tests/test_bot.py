@@ -89,18 +89,22 @@ class TestConfiguration(unittest.TestCase):
             "itunes_submit_phone", "itunes_enter_code_box",
             "itunes_didnt_get_code", "itunes_submit_code",
         }
-        self.assertEqual(expected, set(bot.COORDS_1440x900.keys()))
+        self.assertEqual(expected, set(bot.PROFILES["1440x900"]["coords"].keys()))
 
     def test_coords_are_2_tuples(self):
-        for key, val in bot.COORDS_1440x900.items():
+        for key, val in bot.PROFILES["1440x900"]["coords"].items():
             self.assertEqual(len(val), 2, f"{key} should be (x, y)")
 
-    def test_coords_within_1440x900(self):
-        for key, (x, y) in bot.COORDS_1440x900.items():
-            self.assertGreater(x, 0, f"{key} x must be > 0")
-            self.assertLessEqual(x, 1440, f"{key} x must be <= 1440")
-            self.assertGreater(y, 0, f"{key} y must be > 0")
-            self.assertLessEqual(y, 900, f"{key} y must be <= 900")
+    def test_coords_and_regions_fit_their_screen(self):
+        for name, profile in bot.PROFILES.items():
+            width, height = (int(n) for n in name.split("x"))
+            spots = list(profile["coords"].items())
+            for key in ("taskbar_discord_region", "taskbar_itunes_region"):
+                if profile[key]:
+                    x, y, w, h = profile[key]
+                    spots += [(key, (x, y)), (key, (x + w, y + h))]
+            for key, (x, y) in spots:
+                self.assertTrue(0 < x <= width and 0 < y <= height, f"{name} {key} {(x, y)} is off screen")
 
 
 class TestImgPath(unittest.TestCase):
@@ -577,7 +581,7 @@ class TestClickItunesSubmit(unittest.TestCase):
         calls = []
         discord_in_front = [True, False]  # 1st click hit a notification, 2nd reached Submit
         with mock.patch.object(bot, "close_notifications", lambda: calls.append("close")), \
-             mock.patch.object(bot, "click_element", lambda name, **k: calls.append("submit")), \
+             mock.patch.object(bot, "click_element", lambda name, **k: calls.append("submit") or Point(1, 1)), \
              mock.patch.object(bot, "wait_for_window", lambda name, timeout=4: discord_in_front.pop(0)), \
              mock.patch.object(bot, "switch_to_itunes", lambda: calls.append("back to iTunes")), \
              mock.patch("builtins.print"):
@@ -588,10 +592,95 @@ class TestClickItunesSubmit(unittest.TestCase):
         from unittest import mock
         calls = []
         with mock.patch.object(bot, "close_notifications", lambda: calls.append("close")), \
-             mock.patch.object(bot, "click_element", lambda name, **k: calls.append("submit")), \
+             mock.patch.object(bot, "click_element", lambda name, **k: calls.append("submit") or Point(1, 1)), \
              mock.patch.object(bot, "wait_for_window", lambda name, timeout=4: False):
             self.assertTrue(bot.click_itunes_submit((1207, 737)))
         self.assertEqual(calls, ["close", "submit"])
+
+
+class TestResolutionProfiles(unittest.TestCase):
+    """images/<resolution>/ per screen size; images it lacks come from images/1440x900/."""
+
+    def tearDown(self):
+        bot.select_profile(bot.BASE_PROFILE)
+
+    def test_base_profile_uses_its_own_folder(self):
+        bot.select_profile("1440x900")
+        self.assertEqual(bot.img_path("discord_claim_btn.png"),
+                         os.path.join(bot.IMAGES_ROOT, "1440x900", "discord_claim_btn.png"))
+
+    def test_missing_image_is_borrowed_from_1440x900(self):
+        bot.select_profile("1920x1080")
+        self.assertEqual(bot.img_path("discord_claim_btn.png"),
+                         os.path.join(bot.IMAGES_ROOT, "1440x900", "discord_claim_btn.png"))
+
+    def test_own_image_wins(self):
+        import shutil
+        import tempfile
+        from unittest import mock
+        root = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(root, "1920x1080"))
+            os.makedirs(os.path.join(root, "1440x900"))
+            open(os.path.join(root, "1920x1080", "discord_claim_btn.png"), "wb").close()
+            with mock.patch.object(bot, "IMAGES_ROOT", root):
+                bot.select_profile("1920x1080")
+                self.assertEqual(bot.img_path("discord_claim_btn.png"),
+                                 os.path.join(root, "1920x1080", "discord_claim_btn.png"))
+                self.assertEqual(bot.img_path("discord_reject_btn.png"),
+                                 os.path.join(root, "1440x900", "discord_reject_btn.png"))
+        finally:
+            shutil.rmtree(root)
+
+    def test_1920_has_no_blind_click_spots(self):
+        bot.select_profile("1920x1080")
+        self.assertIsNone(bot.coord("itunes_submit_phone"))
+        bot.select_profile("1440x900")
+        self.assertEqual(bot.coord("itunes_submit_phone"), (1207, 737))
+
+    def test_1920_searches_the_whole_taskbar(self):
+        from unittest import mock
+        bot.select_profile("1920x1080")
+        with mock.patch.object(bot.pyautogui, "size", lambda: (1920, 1080), create=True):
+            self.assertEqual(bot.taskbar_region("taskbar_itunes_region"), (0, 1020, 1920, 60))
+
+    def test_switching_profile_reloads_images(self):
+        bot._templates["discord_claim_btn.png"] = "cached"
+        bot.select_profile("1920x1080")
+        self.assertNotIn("discord_claim_btn.png", bot._templates)
+
+    def test_no_blind_click_when_the_taskbar_icon_is_not_found(self):
+        from unittest import mock
+        bot.select_profile("1920x1080")
+        with mock.patch.object(bot, "get_active_window_title", lambda: "Discord"), \
+             mock.patch.object(bot, "locate_element", lambda *a, **k: None), \
+             mock.patch.object(bot, "human_click", lambda *a, **k: self.fail("clicked a guessed spot")), \
+             mock.patch("builtins.print"):
+            bot.switch_to_itunes()
+
+
+class TestAskResolution(unittest.TestCase):
+    def test_from_command_line(self):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["bot.py", "2", "1920x1080"]):
+            self.assertEqual(bot.ask_resolution(), "1920x1080")
+            self.assertEqual(bot.ask_verification_limit(), 2)
+
+    def test_resolution_argument_is_not_read_as_a_limit(self):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["bot.py", "1920x1080"]), \
+             mock.patch("builtins.input", return_value="3"):
+            self.assertEqual(bot.ask_verification_limit(), 3)
+
+    def test_menu_choice_and_detected_default(self):
+        from unittest import mock
+        with mock.patch.object(sys, "argv", ["bot.py"]), \
+             mock.patch.object(bot.pyautogui, "size", lambda: (1920, 1080), create=True), \
+             mock.patch("builtins.print"):
+            with mock.patch("builtins.input", return_value=""):
+                self.assertEqual(bot.ask_resolution(), "1920x1080")
+            with mock.patch("builtins.input", side_effect=["9", "1"]):
+                self.assertEqual(bot.ask_resolution(), "1440x900")
 
 
 if __name__ == "__main__":
