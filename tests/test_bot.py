@@ -381,21 +381,33 @@ class TestCopyTicketValue(unittest.TestCase):
         self.assertEqual(number, "06 12 36 54 85")
 
 
-class TestPastingIntoItunes(unittest.TestCase):
-    """After pasting, the field is read back: it must hold the new value, not the previous ticket's."""
+class TestEnteringIntoItunes(unittest.TestCase):
+    """
+    The number and code are typed (no clipboard needed), then checked: the field must look different
+    afterwards and, when it can be read back, hold the value - not, say, the previous ticket's number.
+    """
 
-    def _paste(self, text, field="07 22 22 22 22", paste_fails=0, readable=True):
+    def _enter(self, text, field="", typing_fails=0, readable=True, clipboard_works=True):
+        import numpy as np
         from unittest import mock
-        state = {"field": field, "board": "", "selected": False, "fails": paste_fails}
+        state = {"field": field, "board": "", "selected": False, "fails": typing_fails}
+
+        def snapshot(region):
+            # the field's look: white with a dark mark per character typed into it
+            image = np.full((8, 300, 3), 255, np.uint8)
+            for i in range(len(state["field"])):
+                image[2:6, 10 + 7 * i:14 + 7 * i] = 0
+            return image
+
+        def typed(text):
+            if state["fails"]:
+                state["fails"] -= 1  # the keys did not reach the field
+            else:
+                state["field"] += text
 
         def hotkey(*keys):
             if keys == ("ctrl", "a"):
                 state["selected"] = True
-            elif keys == ("ctrl", "v"):
-                if state["fails"]:
-                    state["fails"] -= 1  # the paste did not reach the field
-                else:
-                    state["field"] = state["board"]
             elif keys == ("ctrl", "c") and state["selected"] and readable:
                 state["board"] = state["field"]
 
@@ -404,28 +416,37 @@ class TestPastingIntoItunes(unittest.TestCase):
                 state["field"] = ""
             state["selected"] = False
 
-        with mock.patch.object(bot, "human_hotkey", hotkey), \
+        def set_board(text):
+            if clipboard_works:
+                state["board"] = text
+
+        with mock.patch.object(bot, "grab_bgr", snapshot), \
+             mock.patch.object(bot, "human_type", typed), \
+             mock.patch.object(bot, "human_hotkey", hotkey), \
              mock.patch.object(bot, "human_press", press), \
-             mock.patch.object(bot, "set_clipboard_text", lambda t: state.update(board=t)), \
+             mock.patch.object(bot, "human_click", lambda *a, **k: None), \
+             mock.patch.object(bot, "set_clipboard_text", set_board), \
              mock.patch.object(bot, "get_clipboard_text", lambda: state["board"]), \
              mock.patch.object(bot, "human_pause", lambda *a, **k: None), \
              mock.patch.object(bot.time, "sleep", lambda s: None), \
              mock.patch("builtins.print"):
-            return bot.replace_field_text(text), state["field"]
+            return bot.replace_field_text(text, (871, 253)), state["field"]
 
-    def test_pasted_value_is_checked(self):
-        self.assertEqual(self._paste("06 12 36 54 85"), (True, "06 12 36 54 85"))
+    def test_typed_value_is_checked(self):
+        self.assertEqual(self._enter("06 12 36 54 85", field="07 22 22 22 22"), (True, "06 12 36 54 85"))
 
-    def test_pastes_again_when_the_field_still_shows_the_old_number(self):
-        self.assertEqual(self._paste("06 12 36 54 85", paste_fails=1), (True, "06 12 36 54 85"))
+    def test_works_when_another_program_holds_the_clipboard(self):
+        # pasting put nothing in the field then; typing does not need the clipboard
+        self.assertEqual(self._enter("1122", clipboard_works=False), (True, "1122"))
 
-    def test_gives_up_when_the_field_keeps_the_old_number(self):
-        ok, field = self._paste("06 12 36 54 85", paste_fails=5)
-        self.assertFalse(ok)
-        self.assertEqual(field, "07 22 22 22 22")
+    def test_types_again_when_nothing_showed_up(self):
+        self.assertEqual(self._enter("1122", typing_fails=1), (True, "1122"))
 
-    def test_a_field_that_cannot_be_read_back_is_trusted(self):
-        self.assertEqual(self._paste("1122", field="", readable=False), (True, "1122"))
+    def test_gives_up_when_it_never_shows_up(self):
+        self.assertEqual(self._enter("1122", typing_fails=5), (False, ""))
+
+    def test_a_field_that_cannot_be_read_back_is_judged_by_its_look(self):
+        self.assertEqual(self._enter("1122", readable=False), (True, "1122"))
 
 
 class TestWaitForClaim(unittest.TestCase):
@@ -1306,7 +1327,7 @@ class TestOneTryWhileAnotherTicketWaits(_WorkState):
              mock.patch.object(bot, "claim_from_notification", lambda screen=None: False), \
              mock.patch.object(bot, "wait_for_element", lambda name, **k: Point(500, 300)), \
              mock.patch.object(bot, "human_click", lambda *a, **k: None), \
-             mock.patch.object(bot, "replace_field_text", lambda text: True), \
+             mock.patch.object(bot, "replace_field_text", lambda text, at: True), \
              mock.patch.object(bot, "human_scroll", lambda n: None), \
              mock.patch.object(bot, "remember_spot", lambda *a: None), \
              mock.patch.object(bot, "spot", lambda name: (580, 300)), \
