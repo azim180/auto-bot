@@ -607,12 +607,14 @@ class TestBestMatch(unittest.TestCase):
         from PIL import Image
         # iTunes draws a thick dark border round the field that has the cursor: the plain crops score ~0.4
         for name in ("itunes_enter_code_input.png", "itunes_phone_input.png"):
-            stem = name[:-4]
-            selected = Image.open(bot.img_path(stem + "@selected.png")).convert("RGB")
-            screen = Image.new("RGB", (1920, 1080), (255, 255, 255))
-            screen.paste(selected, (600, 300))
-            self.assertEqual(bot.locate_element(name, confidence=0.80, screen=screen),
-                             Point(600 + selected.width // 2, 300 + selected.height // 2), name)
+            variants = bot._variants(name)[1:]
+            self.assertTrue(variants, name)
+            for variant in variants:  # every saved look of the field, each found at the same spot
+                selected = Image.open(bot.img_path(variant)).convert("RGB")
+                screen = Image.new("RGB", (1920, 1080), (255, 255, 255))
+                screen.paste(selected, (600, 300))
+                self.assertEqual(bot.locate_element(name, confidence=0.80, screen=screen),
+                                 Point(600 + selected.width // 2, 300 + selected.height // 2), variant)
 
     def test_nothing_found_returns_none(self):
         screen = self._screen_with([])
