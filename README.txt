@@ -87,6 +87,14 @@ code within 1 minute, or a wrong code, and the ticket is failed right away so
 the next one can start. With nobody else waiting it is as before: 2 minutes,
 and after a wrong code a Resend Code and a second try.
 
+CHECKING IT IS UP TO DATE / WHEN SOMETHING GOES WRONG:
+The top of the console shows "Version: <code> <date>" - the update this copy
+is at; after auto-pull brings an update, restart start_bot.bat to use it.
+If iTunes' code page is not recognised after Submit, the console prints how
+well each of its images matched (title, Code field, "Didn't get a
+verification code?" link) and saves the screen as debug_code_page.png in
+this folder. Send both when something goes wrong.
+
 DURING A TICKET:
 The bot remembers its ticket by the phone-number box, so new tickets arriving
 (and pushing it up the chat) don't confuse it - it scrolls up to it if needed

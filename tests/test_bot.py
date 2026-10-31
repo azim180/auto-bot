@@ -1586,6 +1586,52 @@ class TestTwoServers(unittest.TestCase):
         self.assertEqual(ticket.server, self.SERVER_2)
 
 
+@unittest.skipUnless(hasattr(sys.modules.get("cv2"), "matchTemplate"), "needs opencv")
+class TestItunesCodePage(unittest.TestCase):
+    """The code page is recognised by more than the Code field, whose look changes when selected."""
+
+    def _page(self, *names):
+        from PIL import Image
+        screen = Image.new("RGB", (1920, 1080), (255, 255, 255))
+        spots = {"itunes_code_page_title.png": (728, 195), "itunes_didnt_get_code_link@1080p.png": (693, 279),
+                 "itunes_enter_code_input.png": (657, 224)}
+        for name in names:
+            screen.paste(Image.open(bot.img_path(name)).convert("RGB"), spots[name])
+        return screen
+
+    def _on(self, screen, fn, remembered=None):
+        from unittest import mock
+        shoot = lambda region=None: screen if region is None else screen.crop(
+            (region[0], region[1], region[0] + region[2], region[1] + region[3]))
+        with mock.patch.object(bot.pyautogui, "screenshot", shoot, create=True), \
+             mock.patch.object(bot, "spot", lambda name: remembered), \
+             mock.patch.object(bot, "remember_spot", lambda *a: None):
+            return fn()
+
+    def test_recognised_by_its_title_or_link_when_the_field_looks_different(self):
+        page = self._page("itunes_code_page_title.png", "itunes_didnt_get_code_link@1080p.png")
+        self.assertIn(self._on(page, lambda: bot.wait_for_any(bot.CODE_PAGE_SIGNS, timeout=0.3)),
+                      ("itunes_didnt_get_code_link.png", "itunes_code_page_title.png"))
+
+    def test_code_field_found_from_the_link_under_it(self):
+        page = self._page("itunes_didnt_get_code_link@1080p.png")
+        self.assertEqual(self._on(page, lambda: bot.find_code_field(timeout=0.2)), (832, 259))
+
+    def test_code_field_from_its_own_image_first(self):
+        page = self._page("itunes_enter_code_input.png", "itunes_didnt_get_code_link@1080p.png")
+        self.assertEqual(self._on(page, lambda: bot.find_code_field(timeout=0.2), remembered=(871, 253)), (871, 253))
+
+    def test_says_how_close_it_came_and_saves_a_screenshot(self):
+        from unittest import mock
+        folder, printed = tempfile.mkdtemp(), []
+        with mock.patch.object(bot, "BOT_DIR", folder), \
+             mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            self._on(self._page("itunes_code_page_title.png"),
+                     lambda: bot.explain_not_found([n for n, _ in bot.CODE_PAGE_SIGNS], "code page"))
+        self.assertTrue(os.path.exists(os.path.join(folder, "debug_code_page.png")))
+        self.assertTrue(any("itunes_code_page_title.png 1.00" in line for line in printed), printed)
+
+
 class TestDisplayScale(unittest.TestCase):
     """The scaling is read live from the main monitor, so a change while the bot runs is seen."""
 
