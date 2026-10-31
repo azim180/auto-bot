@@ -823,41 +823,26 @@ def copy_selection(timeout=1.5, old=""):
     return ""
 
 
-def _changed_pixels(before, after):
-    """How many pixels differ clearly between two snapshots of the same area."""
-    return int((np.abs(before.astype(int) - after.astype(int)).max(axis=2) > 60).sum())
-
-
-def replace_field_text(text, at):
+def replace_field_text(text):
     """
-    Types `text` into the iTunes field at `at` (already clicked), replacing what is in it. Typing
-    needs no clipboard, which another program can hold on to; a paste then puts in nothing, or the
-    previous ticket's number. Then checks it went in: the field must look different (the "Enter
-    code" placeholder goes, the digits show) and, if it can be read back (select all, copy), hold
-    `text`. Clicks the field and tries once more; False if it still did not go in.
+    Clears the focused input and pastes `text`, then reads the field back (select all, copy) to make
+    sure it holds `text` - not, say, the previous ticket's number. False if it still does not after
+    a second paste; True also when the field cannot be read back.
     """
-    area = (int(at[0]) - px(200, "itunes"), int(at[1]) - px(4, "itunes"), px(300, "itunes"), px(8, "itunes"))
     wanted = re.sub(r"\D", "", text).lstrip("0")
     for attempt in (1, 2):
-        if attempt == 2:
-            human_click(*at)
         human_hotkey("ctrl", "a")
         human_press("backspace")
-        human_pause(0.05, 0.1)
-        before = grab_bgr(area)
-        human_type(text)
-        human_pause(0.1, 0.2)
-        after = grab_bgr(area)
-        if before is not None and after is not None and _changed_pixels(before, after) < px(15, "itunes"):
-            print(f"[WARN] Typed {text!r} but nothing showed up in iTunes' field (try {attempt}/2)")
-            continue
+        set_clipboard_text(text)
+        human_hotkey("ctrl", "v")
+        human_pause(0.08, 0.15)
         old = emptied_clipboard()
         human_hotkey("ctrl", "a")
         shown = copy_selection(timeout=0.8, old=old)
         human_press("end")  # unselect
         if not shown or not wanted or re.sub(r"\D", "", shown).lstrip("0") == wanted:
             return True
-        print(f"[WARN] The field shows {shown!r} instead of {text!r} (try {attempt}/2)")
+        print(f"[WARN] The field shows {shown!r} instead of {text!r} - pasting again (try {attempt}/2)")
     return False
 
 
@@ -1726,7 +1711,7 @@ def verify_with_itunes(ticket, phone_number):
     if not wait_for_element("itunes_phone_input.png", timeout=2, confidence=0.80):
         run_itunes_reset_cycle(return_to_discord=False)
 
-    # Click inside the +33 phone number field and type the number as-is
+    # Click inside the +33 phone number field and paste as-is
     phone_loc = wait_for_element("itunes_phone_input.png", timeout=8, confidence=0.80)
     if phone_loc:
         remember_spot("itunes_phone_input_box", (phone_loc.x + px(80, "itunes"), phone_loc.y))
@@ -1735,7 +1720,7 @@ def verify_with_itunes(ticket, phone_number):
         print("[WARN] Could not find iTunes' phone number field. Leaving this ticket for a human.")
         return False
     human_click(*phone_field)
-    if not replace_field_text(phone_number, phone_field):
+    if not replace_field_text(phone_number):
         print("[WARN] Could not get the phone number into iTunes. Leaving this ticket for a human.")
         return False
 
@@ -1791,7 +1776,7 @@ def verify_with_itunes(ticket, phone_number):
             print("[WARN] Could not find iTunes' code field. Leaving this ticket for a human.")
             return False
         human_click(*code_field)
-        if not replace_field_text(code, code_field):
+        if not replace_field_text(code):
             print("[WARN] Could not get the code into iTunes. Leaving this ticket for a human.")
             return False
 
