@@ -82,6 +82,29 @@ VALUE_BOX_RGB = (40, 41, 57)
 NUMBER_BOX_OFFSETS = (38, 110)
 CODE_BOX_OFFSETS = (31, 56)
 
+# Every image in images/, the extra looks (<name>@<look>.png) included. Checked at startup: a missing
+# one means the images folder is older than bot.py, and some screens will not be recognised.
+IMAGE_FILES = (
+    "discord_action_dropdown.png", "discord_chat_input.png", "discord_claim_btn.png",
+    "discord_code_label.png", "discord_code_left.png", "discord_failed_verification_btn.png",
+    "discord_mark_verified_btn.png", "discord_menu_billing_issue.png",
+    "discord_menu_failed_verification.png", "discord_menu_mark_verified.png", "discord_menu_reject.png",
+    "discord_menu_resend_code.png", "discord_number_label.png", "discord_reject_btn.png",
+    "discord_resend_available.png", "discord_resend_disabled.png", "discord_server1_icon.png",
+    "discord_server2_icon.png", "discord_server_line.png", "discord_server_returning_warn.png",
+    "itunes_account_settings_header.png", "itunes_add_payment_btn.png",
+    "itunes_billing_issue_banner.png", "itunes_code_page_title.png", "itunes_didnt_get_code_link.png",
+    "itunes_didnt_get_code_link@1080p.png", "itunes_enter_code_input.png",
+    "itunes_enter_code_input@selected.png", "itunes_enter_code_input@selected2.png",
+    "itunes_enter_code_input@selected3.png", "itunes_manage_payments_link.png",
+    "itunes_menu_account.png", "itunes_menu_view_account.png", "itunes_mobile_carrier_icon.png",
+    "itunes_mobile_phone_verified.png", "itunes_phone_input.png", "itunes_phone_input@selected.png",
+    "itunes_popup_ok_btn.png", "itunes_submit_btn.png", "itunes_unable_to_send_code.png",
+    "itunes_unable_to_verify_code.png", "notif_close_btn.png", "notif_code_submitted.png",
+    "notif_discord_header.png", "notif_new_ticket_blue.png", "notif_new_ticket_purple.png",
+    "taskbar_discord_right.png", "taskbar_itunes.png",
+)
+
 # The two Discord servers tickets come from, each with a #code-farm. Each has its own icon in
 # Discord's server list and its own new-ticket notification (server 1: green cash icon, blue/black
 # notification; server 2: grey cash icon, purple notification). Every ticket remembers its server,
@@ -1851,12 +1874,14 @@ def _cli_args():
 
 def bot_version():
     """The update this copy of the bot is at (its last git commit), to check an update arrived."""
+    if not os.path.exists(os.path.join(BOT_DIR, ".git")):
+        return "unknown - this folder is not a git copy, so auto-pull cannot update it"
     try:
         out = subprocess.run(["git", "-C", BOT_DIR, "log", "-1", "--format=%h %cd", "--date=format:%Y-%m-%d %H:%M"],
                              capture_output=True, text=True, timeout=5)
-        return out.stdout.strip() or "unknown"
+        return out.stdout.strip() or "unknown - git could not read this folder"
     except Exception:
-        return "unknown"
+        return "unknown - git is not installed"
 
 
 def startup_check():
@@ -1868,9 +1893,11 @@ def startup_check():
     if abs(scale - 1.0) > 0.01:
         print("[SETUP] The images were cropped at 100%, so they are resized to match. If buttons are "
               "missed, 100% (Settings > System > Display > Scale) is the most reliable.")
-    missing = [name for name in sorted(set(sum(SCALE_ANCHORS.values(), ()))) if not os.path.exists(img_path(name))]
+    missing = [name for name in IMAGE_FILES if not os.path.exists(img_path(name))]
     if missing:
-        print(f"[WARN] Missing images in images/: {', '.join(missing)}")
+        print(f"[WARN] {len(missing)} image(s) missing from images/ - this images folder is older than bot.py, "
+              f"so some screens will not be recognised. Update the whole bot folder, images included. "
+              f"Missing: {', '.join(missing)}")
     spots = _known_spots()
     print(f"[SETUP] Backup click spots for this screen: {len(spots)}" +
           ("" if spots else " yet (it remembers where it finds each button)."))
