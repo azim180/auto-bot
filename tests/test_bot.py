@@ -109,6 +109,41 @@ class TestConfiguration(unittest.TestCase):
                 self.assertIn(name.split("_")[0], ("discord", "itunes", "notif", "taskbar"), name)
 
 
+class TestOutOfDateFolder(unittest.TestCase):
+    """A PC that got the new bot.py but not the new images is told so at startup."""
+
+    def test_image_list_matches_the_images_folder(self):
+        # add every new image (and extra look) to IMAGE_FILES, or the startup check misses it
+        on_disk = sorted(f for f in os.listdir(bot.IMAGES_DIR) if f.endswith(".png"))
+        self.assertEqual(sorted(bot.IMAGE_FILES), on_disk)
+
+    def test_startup_lists_the_missing_images(self):
+        import shutil
+        from unittest import mock
+        folder = tempfile.mkdtemp()
+        old = [n for n in bot.IMAGE_FILES if n not in ("itunes_code_page_title.png", "itunes_enter_code_input@selected.png")]
+        for name in old:
+            shutil.copy(os.path.join(bot.IMAGES_DIR, name), folder)
+        printed = []
+        with mock.patch.object(bot, "IMAGES_DIR", folder), \
+             mock.patch.object(bot, "grab_screen", lambda: None), \
+             mock.patch.object(bot, "_spots", {}), \
+             mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            try:
+                bot.startup_check()
+            finally:
+                bot.scale_confirmed.update(bot.UI_GROUPS)
+        warning = [line for line in printed if "missing from images/" in line]
+        self.assertTrue(warning, printed)
+        self.assertIn("itunes_code_page_title.png", warning[0])
+        self.assertIn("itunes_enter_code_input@selected.png", warning[0])
+
+    def test_version_explains_a_folder_auto_pull_cannot_update(self):
+        from unittest import mock
+        with mock.patch.object(bot, "BOT_DIR", tempfile.mkdtemp()):
+            self.assertIn("not a git copy", bot.bot_version())
+
+
 class TestImgPath(unittest.TestCase):
     def test_returns_string(self):
         result = bot.img_path("discord_claim_btn.png")

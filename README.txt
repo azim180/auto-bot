@@ -90,6 +90,10 @@ and after a wrong code a Resend Code and a second try.
 CHECKING IT IS UP TO DATE / WHEN SOMETHING GOES WRONG:
 The top of the console shows "Version: <code> <date>" - the update this copy
 is at; after auto-pull brings an update, restart start_bot.bat to use it.
+"Version: unknown - this folder is not a git copy" means auto-pull cannot
+update this folder: copy the WHOLE bot folder (images included) when you
+update it by hand. If the images folder is older than bot.py, the bot says
+so at startup ("[WARN] ... image(s) missing from images/") and names them.
 If iTunes' code page is not recognised after Submit, the console prints how
 well each of its images matched (title, Code field, "Didn't get a
 verification code?" link) and saves the screen as debug_code_page.png in
