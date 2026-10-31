@@ -6,6 +6,7 @@ import math
 import time
 import random
 import ctypes
+import subprocess
 import collections
 import tkinter as tk
 
@@ -91,6 +92,16 @@ SERVERS = {
 }
 # The two icons look alike from afar; only a close match is taken as one of them
 SERVER_ICON_CONFIDENCE = 0.85
+
+# Any of these shows iTunes is on the "Enter the verification code" page. The Code field alone is
+# not enough: iTunes draws it differently while it has the cursor.
+CODE_PAGE_SIGNS = [
+    ("itunes_enter_code_input.png", 0.80),       # also matches the selected look (@selected variant)
+    ("itunes_didnt_get_code_link.png", 0.80),
+    ("itunes_code_page_title.png", 0.80),        # "Enter the verification code sent to"
+]
+# Where to click in the Code field, from the center of the "Didn't get a verification code?" link
+CODE_FIELD_FROM_LINK = (-10, -40)
 
 # Where a Windows notification's X is, from the center of its "⋯ ✕" image or its Discord header
 NOTIF_CLOSE_FROM_DOTS = (20, 0)
@@ -1159,6 +1170,43 @@ def click_itunes_submit(spot_name):
     return False
 
 
+def find_code_field(timeout=4):
+    """
+    Where to click in iTunes' Code field: from its image (selected or not), else from the
+    "Didn't get a verification code?" link right under it, else where it was last time.
+    """
+    box = wait_for_element("itunes_enter_code_input.png", timeout=timeout, confidence=0.80)
+    if box:
+        remember_spot("itunes_enter_code_box", (box.x + px(30, "itunes"), box.y))
+        return spot("itunes_enter_code_box")
+    link = locate_element("itunes_didnt_get_code_link.png", confidence=0.80)
+    if link:
+        return (link.x + px(CODE_FIELD_FROM_LINK[0], "itunes"), link.y + px(CODE_FIELD_FROM_LINK[1], "itunes"))
+    return spot("itunes_enter_code_box")
+
+
+def explain_not_found(images, what):
+    """When an expected iTunes page did not show up: how close each image came, and a screenshot to look at."""
+    screen = grab_screen()
+    if screen is None:
+        return
+    scores = []
+    for name in images:
+        try:
+            found = _match_scores(name, screen=screen)
+        except Exception:
+            found = None
+        scores.append(f"{name} {float(found[0].max()):.2f}" if found else f"{name} -")
+    print(f"[DEBUG] {what}: best matches {', '.join(scores)}; iTunes size {ui_scale['itunes']:.0%}, "
+          f"window in front: {get_active_window_title()!r}")
+    path = os.path.join(BOT_DIR, "debug_" + what.replace(" ", "_") + ".png")
+    try:
+        screen.save(path)
+        print(f"[DEBUG] Screenshot saved: {path}")
+    except Exception:
+        pass
+
+
 # ==============================================================================
 # ITUNES NAVIGATION & RESET CYCLE (Resets 10-Minute Timer to 0)
 # ==============================================================================
@@ -1682,10 +1730,8 @@ def verify_with_itunes(ticket, phone_number):
 
     print("[ITUNES] Waiting for iTunes to send the code...")
     # (it moves on as soon as the page shows; some PCs/connections take a while to send the code)
-    result = wait_for_any([
-        ("itunes_unable_to_send_code.png", 0.80),
-        ("itunes_enter_code_input.png", 0.80),
-    ], timeout=30, watch_tickets=True)
+    result = wait_for_any([("itunes_unable_to_send_code.png", 0.80)] + CODE_PAGE_SIGNS,
+                          timeout=30, watch_tickets=True)
 
     # CHECK 1: Did "Unable to Send Code" popup appear?
     if result == "itunes_unable_to_send_code.png":
@@ -1701,6 +1747,7 @@ def verify_with_itunes(ticket, phone_number):
     # CHECK 2: Did iTunes reach the "Enter the verification code" screen?
     if result is None:
         print("[WARN] Did not reach code entry screen. Resetting iTunes...")
+        explain_not_found([name for name, _ in CODE_PAGE_SIGNS], "code page")
         run_itunes_reset_cycle(return_to_discord=True)
         return False
 
@@ -1724,10 +1771,7 @@ def verify_with_itunes(ticket, phone_number):
         # Switch to iTunes, enter the code, and click Submit
         switch_to_itunes()
         claim_from_notification()
-        code_box = wait_for_element("itunes_enter_code_input.png", timeout=4, confidence=0.80)
-        if code_box:
-            remember_spot("itunes_enter_code_box", (code_box.x + px(30, "itunes"), code_box.y))
-        code_field = spot("itunes_enter_code_box")  # just found there, or where it was last time
+        code_field = find_code_field()
         if not code_field:
             print("[WARN] Could not find iTunes' code field. Leaving this ticket for a human.")
             return False
@@ -1805,6 +1849,16 @@ def _cli_args():
     return [arg.strip() for arg in sys.argv[1:]]
 
 
+def bot_version():
+    """The update this copy of the bot is at (its last git commit), to check an update arrived."""
+    try:
+        out = subprocess.run(["git", "-C", BOT_DIR, "log", "-1", "--format=%h %cd", "--date=format:%Y-%m-%d %H:%M"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def startup_check():
     """Says what the bot is working with, and measures how big each app on screen is drawn."""
     reset_ui_scale()
@@ -1860,6 +1914,7 @@ def main():
     print("==================================================================")
     print("  DISCORD <-> ITUNES VISUAL AUTOMATION BOT")
     print("  Safety Abort: Slam mouse into ANY of the 4 screen corners.")
+    print(f"  Version: {bot_version()}")
     print("==================================================================")
     limit = ask_verification_limit()
     print(f"[SETUP] Will stop after {limit} verification(s)." if limit else "[SETUP] No limit - runs until you close it.")
